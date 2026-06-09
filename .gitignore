@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.workbench/
+.tenet/
+.playwright-mcp/
+.codegraph/
+.vite/
+*.log
+.env
+.env.*
+!.env.example
