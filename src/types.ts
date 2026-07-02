@@ -8,6 +8,7 @@ export type Settings = {
   uploadDefaults: UploadDraft;
   serviceSettings: ServiceSettings;
   asrTools: LocalAsrStatus;
+  recording?: RecordingConfigResponse;
 };
 
 export type RecordingRootCandidate = {
@@ -56,6 +57,7 @@ export type Room = {
     size: number;
   };
   coverUrl: string | null;
+  materialRooms?: Room[];
 };
 
 export type RoomDetail = {
@@ -81,7 +83,10 @@ export type VideoAsset = {
   height: number | null;
   playable: boolean;
   xml: null | FileRef;
+  danmakuCount?: number;
+  danmakuDuration?: number;
   subtitles: FileRef[];
+  remuxTarget?: null | (FileRef & { exists: boolean; size: number });
   thumbnailUrl: string;
 };
 
@@ -109,6 +114,8 @@ export type SubtitleCue = {
   end: number;
   text: string;
   source?: string;
+  timebase?: "segment" | "global" | string;
+  originalTimebase?: "segment" | "global" | string;
 };
 
 export type HistogramBin = {
@@ -163,6 +170,35 @@ export type ClipCandidate = {
   score: number;
   reason: string;
   evidence: string[];
+  signal?: {
+    funnyHits: number;
+    reactionHits: number;
+    questionHits: number;
+    danmakuCount: number;
+    subtitleCount: number;
+    peakCount: number;
+    hotText: string;
+  };
+  automation?: {
+    eligibleForAutoUpload: boolean;
+    confidence: "high" | "review" | string;
+    score: number;
+    signalFamilies: string[];
+    policyReason: string;
+  };
+};
+
+export type AiSliceDiagnostics = {
+  engine: "model-only" | string;
+  modelStatus: "ok" | "error" | "not-configured" | "no-candidates" | "empty-response" | string;
+  modelUsed: boolean;
+  endpoint?: string;
+  wireApi?: string;
+  model?: string;
+  mediaImagesRequested?: number;
+  mediaImagesUsed?: number;
+  warnings?: string[];
+  message: string;
 };
 
 export type ClipDraft = ClipCandidate & {
@@ -181,6 +217,18 @@ export type UploadPart = {
 
 export type UploadDraft = {
   publishMode?: "upload" | "append";
+  uploadPolicy?: "manual-confirm" | "review" | "auto-public" | "auto-only-self" | string;
+  automationPolicy?: "manual-confirm" | "review" | "auto-public" | "auto-only-self" | string;
+  automation?: {
+    eligibleForAutoUpload?: boolean;
+    score?: number;
+    clipScore?: number;
+    evidenceCount?: number;
+    signalFamilies?: string[];
+  };
+  autoApproval?: UploadDraft["automation"];
+  clipScore?: number;
+  evidence?: string[];
   vid?: string;
   visibility?: "public" | "onlySelf";
   isOnlySelf?: number;
@@ -215,6 +263,7 @@ export type UploadDraft = {
 
 export type ServiceSettings = {
   recordingsRoot: string;
+  recording: RecordingSettings;
   asr: {
     mode: "extract-audio" | "funasr-local" | "qwen3-local" | "local-command" | "cloud-endpoint" | string;
     provider: "funasr-nano" | "qwen3-asr-gguf" | "custom-command" | "cloud-endpoint" | string;
@@ -235,6 +284,7 @@ export type ServiceSettings = {
   };
   vision: {
     provider: string;
+    wireApi: "chat-completions" | "responses" | string;
     endpoint: string;
     apiKey: string;
     model: string;
@@ -242,6 +292,10 @@ export type ServiceSettings = {
     sendAudio: boolean;
     sendSubtitles: boolean;
     sendDanmaku: boolean;
+    frameSampleCount: number;
+    audioSpectrum: boolean;
+    sliceTemperature: number;
+    slicePrompt: string;
   };
   cover: {
     provider: string;
@@ -254,7 +308,232 @@ export type ServiceSettings = {
     flvOutputMode: "same-dir" | "compressed-dir" | string;
     deleteSourceAfterConvert: boolean;
     skipIfMp4Exists: boolean;
+    videoTranscodeMode: "compress" | "copy" | string;
+    videoCrf: number;
+    videoPreset: string;
+    audioTranscodeMode: "aac" | "copy" | "lossless" | string;
+    audioBitrateKbps: number;
   };
+  automation: AutomationSettings;
+};
+
+export type AutomationSettings = {
+  enabled: boolean;
+  triggerOnRecordingComplete: boolean;
+  autoAnalyze: boolean;
+  autoExport: boolean;
+  autoUpload: boolean;
+  uploadPolicy: "manual-confirm" | "review" | "auto-public" | "auto-only-self" | string;
+  clipDuration: number;
+  clipCount: number;
+  sources: string[];
+  minScore: number;
+  minEvidenceCount: number;
+  requireHighConfidence: boolean;
+  burnSubtitles: boolean;
+};
+
+export type AutomationJob = {
+  id: string;
+  roomId: string;
+  videoPath: string;
+  trigger: string;
+  triggerEventId: string | null;
+  uploadPolicy: string;
+  status: "queued" | "running" | "ready" | "error" | string;
+  stage: string;
+  message: string;
+  candidates: ClipCandidate[];
+  acceptedClips: ClipDraft[];
+  exportedClips: ClipDraft[];
+  uploadDraftPath?: string | null;
+  uploadPreflight?: unknown;
+  uploadJobId?: string | null;
+  projectPath: string | null;
+  error: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type RecordingMonitorStatus = {
+  enabled: boolean;
+  running: boolean;
+  scheduled: boolean;
+  nextRunAt: string | null;
+  lastResult: {
+    status: string;
+    checked: number;
+    started: number;
+    waiting: number;
+    skipped: number;
+    errors: number;
+    messages?: string[];
+    updatedAt?: string;
+    nextDelayMs?: number;
+  } | null;
+  intervalSeconds: number;
+  enabledRooms: number;
+  activeRecordings: number;
+  waitingRooms: number;
+  updatedAt: string;
+};
+
+export type RecordingEvent = {
+  id: string;
+  type: string;
+  date: string;
+  roomId: string;
+  path: string | null;
+  data?: Record<string, unknown>;
+  receivedAt?: string;
+};
+
+export type RecordingSettings = {
+  backend: "internal" | string;
+  outputDir: string;
+  host: string;
+  port: number;
+  apiKey: string;
+  maxConfiguredRooms: number;
+  maxConcurrentRecordings: number;
+  autoMonitorEnabled: boolean;
+  stabilityHours: number;
+  enableWebhooks: boolean;
+  webhookUrl: string;
+  biliApiBase: string;
+  biliWebApiBase?: string;
+  cookiePath?: string;
+  enableWbiSigning?: boolean;
+  roomFolderTemplate: string;
+  filenameTemplate: string;
+  segmentSeconds: number;
+  fileSizeLimitMb: number;
+  qualityNumber: number;
+  streamFormat: "flv" | "fmp4" | "ts" | string;
+  streamCodec: "avc" | "hevc" | string;
+  recordingMode: "standard" | "raw" | string;
+  bufferSizeKb: number;
+  requestTimeoutSeconds: number;
+  streamTimeoutSeconds: number;
+  disconnectionTimeoutSeconds: number;
+  pollIntervalSeconds: number;
+  reconnectSeconds: number;
+  enableDanmaku: boolean;
+  saveRawDanmaku: boolean;
+  danmakuServer: string;
+  danmuUname: boolean;
+  recordGiftSend: boolean;
+  recordFreeGifts: boolean;
+  recordGuardBuy: boolean;
+  recordSuperChat: boolean;
+  saveCover: boolean;
+  coverSaveStrategy: string;
+  remuxToMp4: boolean;
+  injectExtraMetadata: boolean;
+  deleteSourceAfterRemux: string;
+  spaceCheckIntervalSeconds: number;
+  spaceThresholdMb: number;
+  recycleRecords: boolean;
+};
+
+export type RecordingLimits = {
+  maxConfiguredRooms: number;
+  maxConcurrentRecordings: number;
+  stabilityHours: number;
+};
+
+export type RecordingInternalHealth = {
+  available: boolean;
+  activeRooms: number;
+  outputDir: string;
+  backend: string;
+  message: string;
+};
+
+export type FixedRoom = {
+  roomId: string;
+  inputRoomId: string;
+  name: string;
+  title?: string;
+  realRoomId?: string;
+  shortId?: string;
+  anchorName?: string;
+  anchorUid?: string;
+  avatarUrl?: string;
+  coverUrl?: string;
+  keyframeUrl?: string;
+  areaName?: string;
+  parentAreaName?: string;
+  biliLiveStatus?: "live" | "offline" | "replay" | "unknown" | string;
+  liveTime?: string;
+  metadataUpdatedAt?: string | null;
+  enabled: boolean;
+  priority: number;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+} & RecordingRoomStatus;
+
+export type RecordingRoomStatus = {
+  taskStatus: "idle" | "starting" | "waiting" | "recording" | "finalizing" | "completed" | "error" | string;
+  liveStatus: "unknown" | "live" | "offline" | string;
+  recordingPath: string | null;
+  danmakuPath: string | null;
+  videoSize: number;
+  bytesWritten?: number;
+  segmentBytes?: number;
+  speedBytesPerSecond?: number;
+  averageSpeedBytesPerSecond?: number;
+  elapsedSeconds?: number;
+  staleSeconds?: number;
+  lastBytesAt?: string | null;
+  stalled?: boolean;
+  startedAt?: string | null;
+  monitorCheckedAt?: string | null;
+  nextMonitorAt?: string | null;
+  danmakuSize: number;
+  danmakuCount: number;
+  danmakuStatus?: {
+    enabled?: boolean;
+    connected?: boolean;
+    authenticated?: boolean;
+    source?: string;
+    cookieLoaded?: boolean;
+    uidPresent?: boolean;
+    buvidPresent?: boolean;
+    tokenPresent?: boolean;
+    reconnects?: number;
+    lastMessageAt?: string | null;
+    lastCloseCode?: number | null;
+    lastCloseReason?: string;
+    message?: string;
+  } | null;
+  refreshed: boolean;
+  sync?: string;
+  message: string;
+  nextAction: string;
+  log: string;
+  updatedAt?: string | null;
+};
+
+export type RecordingConfigResponse = {
+  settings?: RecordingSettings;
+  recorder: RecordingInternalHealth;
+  internal?: RecordingInternalHealth;
+  limits: RecordingLimits;
+  rooms?: FixedRoom[];
+};
+
+export type RecordingJob = {
+  id: string;
+  type: string;
+  status: "running" | "ready" | "error" | string;
+  progress: number;
+  message: string;
+  log: string;
+  command: string;
+  outputPath?: string | null;
+  startedAt?: string;
+  updatedAt: string;
 };
 
 export type LocalAsrStatus = {
@@ -295,6 +574,9 @@ export type AsrJob = {
   audioPath: string;
   subtitlePath: string | null;
   subtitles: SubtitleCue[];
+  rangeStart: number;
+  rangeEnd: number | null;
+  timebase: "global" | "segment" | string;
   log: string;
   command?: string;
   startedAt?: string;
@@ -326,6 +608,13 @@ export type WorkbenchTask = {
   log: string;
   command?: string;
   outputPath?: string | null;
+  bytesWritten?: number;
+  speedBytesPerSecond?: number;
+  averageSpeedBytesPerSecond?: number;
+  elapsedSeconds?: number;
+  staleSeconds?: number;
+  stalled?: boolean;
+  danmakuCount?: number;
   startedAt?: string | null;
   updatedAt?: string | null;
 };
@@ -353,6 +642,13 @@ export type UploadPreflight = {
   ok: boolean;
   issues: string[];
   warnings: string[];
+  policy?: {
+    policy: string;
+    canRun: boolean;
+    issues: string[];
+    warnings: string[];
+    effectiveDraft: UploadDraft;
+  };
   command: string;
   tools: UploadTools;
 };

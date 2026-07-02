@@ -1,13 +1,18 @@
 {
   "name": "bil233",
   "version": "1.0.0",
-  "description": "Local visual workbench for blrec/Bilibili live recording assets.",
+  "description": "Local Bilibili live recording, clipping, subtitle, and upload workbench.",
   "main": "server/dev.mjs",
   "scripts": {
     "dev": "node server/dev.mjs",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "start": "node server/dev.mjs",
+    "test:acceptance": "playwright test tests/acceptance",
+    "test:ai-workflow": "node scripts/verify-ai-clipping-workflow.mjs",
+    "test:real-live-api": "node scripts/real-live-smoke.mjs",
+    "test:server": "node --test tests/server",
+    "test:workflow": "node scripts/verify-workflow.mjs",
     "setup": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup.ps1",
     "setup:qwen": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup.ps1 -WithQwen -QwenModelSize 0.6B",
     "start:workbench": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start.ps1"
@@ -17,7 +22,7 @@
   "license": "UNLICENSED",
   "type": "commonjs",
   "dependencies": {
-    "@vitejs/plugin-react": "^6.0.2",
+    "@vitejs/plugin-react": "4.7.0",
     "express": "^5.2.1",
     "fast-xml-parser": "^5.8.0",
     "lucide-react": "^1.17.0",
@@ -25,9 +30,11 @@
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
     "typescript": "^6.0.3",
-    "vite": "^8.0.14"
+    "vite": "6.4.1",
+    "ws": "^8.18.3"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "@types/express": "^5.0.6",
     "@types/mime-types": "^3.0.1",
     "@types/react": "^19.2.15",

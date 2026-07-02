@@ -1,11 +1,17 @@
 import type {
   AsrJob,
   AsrPrepareResponse,
+  AiSliceDiagnostics,
+  AutomationJob,
   ClipCandidate,
   ClipDraft,
   CoverGenerationResponse,
   FlvConvertResponse,
   PreviewStatus,
+  RecordingEvent,
+  FixedRoom,
+  RecordingMonitorStatus,
+  RecordingRoomStatus,
   RecordingRootCandidate,
   ServiceSettings,
   Settings,
@@ -22,7 +28,7 @@ import type {
 export async function getJson<T>(url: string): Promise<T> {
   const response = await fetch(url);
   if (!response.ok) {
-    throw new Error(await readError(response));
+    throw await responseError(response);
   }
   return response.json() as Promise<T>;
 }
@@ -34,7 +40,7 @@ export async function postJson<T>(url: string, body: unknown): Promise<T> {
     body: JSON.stringify(body)
   });
   if (!response.ok) {
-    throw new Error(await readError(response));
+    throw await responseError(response);
   }
   return response.json() as Promise<T>;
 }
@@ -50,12 +56,12 @@ export function loadRecordingRootCandidates() {
 export function requestSliceCandidates(body: {
   videoKey: string;
   sources: string[];
-  clipDuration: number;
   clipCount: number;
+  precisionMode?: "high" | "recall" | string;
   subtitles?: SubtitleCue[];
   danmakuEdits?: Record<string, string>;
 }) {
-  return postJson<{ candidates: ClipCandidate[] }>("/api/ai/slices", body);
+  return postJson<{ candidates: ClipCandidate[]; diagnostics: AiSliceDiagnostics }>("/api/ai/slices", body);
 }
 
 export function loadPreviewStatus(videoKey: string) {
@@ -76,6 +82,96 @@ export function saveServiceSettings(body: ServiceSettings) {
 
 export function loadTasks() {
   return getJson<{ tasks: WorkbenchTask[] }>("/api/tasks");
+}
+
+export function loadAutomationJobs() {
+  return getJson<{ jobs: AutomationJob[] }>("/api/automation/jobs");
+}
+
+export function analyzeVideoAutomation(body: { videoKey: string; uploadPolicy?: string }) {
+  return postJson<{ ok: boolean; job: AutomationJob }>("/api/automation/analyze", body);
+}
+
+export function runAutomationJob(jobId: string) {
+  return postJson<{ ok: boolean; job: AutomationJob }>(`/api/automation/jobs/${encodeURIComponent(jobId)}/run`, {});
+}
+
+export function runRecordingMonitorSweep() {
+  return postJson<{
+    ok: boolean;
+    status: string;
+    checked: number;
+    started: number;
+    waiting: number;
+    skipped: number;
+    errors: number;
+    messages: string[];
+    updatedAt: string;
+  }>("/api/recording/monitor/sweep", {});
+}
+
+export function loadRecordingMonitorStatus() {
+  return getJson<RecordingMonitorStatus>("/api/recording/monitor/status");
+}
+
+export function loadRecordingEvents(limit = 8) {
+  return getJson<{ events: RecordingEvent[] }>(`/api/recording/events?limit=${encodeURIComponent(String(limit))}`);
+}
+
+export function loadFixedRooms(options: { enrich?: boolean } = {}) {
+  const query = options.enrich === false ? "?enrich=0" : "";
+  return getJson<{ rooms: FixedRoom[] }>(`/api/recording/rooms${query}`);
+}
+
+export function addFixedRoom(body: { roomId: string; name?: string }) {
+  return postJson<{ ok: boolean; room: FixedRoom; rooms: FixedRoom[] }>("/api/recording/rooms", body);
+}
+
+export function updateFixedRoom(roomId: string, body: Partial<Pick<FixedRoom, "enabled" | "name" | "priority">>) {
+  return fetch(`/api/recording/rooms/${encodeURIComponent(roomId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }).then(async (response) => {
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || payload.message || response.statusText);
+    return payload as { ok: boolean; room: FixedRoom; rooms: FixedRoom[] };
+  });
+}
+
+export function deleteFixedRoom(roomId: string) {
+  return fetch(`/api/recording/rooms/${encodeURIComponent(roomId)}`, {
+    method: "DELETE"
+  }).then(async (response) => {
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || payload.message || response.statusText);
+    return payload as { ok: boolean; rooms: FixedRoom[] };
+  });
+}
+
+export function deleteMaterialRoom(roomKey: string) {
+  return fetch(`/api/rooms/${encodeURIComponent(roomKey)}`, {
+    method: "DELETE"
+  }).then(async (response) => {
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || payload.message || response.statusText);
+    return payload as { ok: boolean; rooms: import("./types").Room[] };
+  });
+}
+
+export async function postRecordingRoomAction(roomId: string, action: "start" | "stop" | "retry") {
+  const response = await fetch(`/api/recording/rooms/${encodeURIComponent(roomId)}/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({})
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(payload.error || payload.message || response.statusText) as Error & { payload?: unknown };
+    error.payload = payload;
+    throw error;
+  }
+  return payload as RecordingRoomStatus & { roomId: string };
 }
 
 export function generateClipTitle(body: {
@@ -156,19 +252,36 @@ export function prepareAsrModel(body: { provider: string; model: string; modelSi
   return postJson<AsrPrepareResponse>("/api/asr/prepare", body);
 }
 
-export function convertAllFlv(body?: { roomKey?: string }) {
+export function convertAllFlv(body?: { roomKey?: string; videoKeys?: string[] }) {
   return postJson<FlvConvertResponse>("/api/media/convert-flv", body || {});
 }
 
 export function testVisionSettings(body: Partial<ServiceSettings["vision"]>) {
-  return postJson<{ ok: boolean; elapsedMs: number; endpoint: string; model: string; response: unknown }>("/api/vision/test", body);
+  return postJson<{ ok: boolean; elapsedMs: number; endpoint: string; wireApi: string; model: string; response: unknown }>("/api/vision/test", body);
 }
 
-async function readError(response: Response) {
+async function responseError(response: Response) {
+  const payload = await readErrorPayload(response);
+  const message = readablePayloadMessage(payload, response.statusText);
+  const error = new Error(message) as Error & { payload?: unknown };
+  error.payload = payload;
+  return error;
+}
+
+async function readErrorPayload(response: Response) {
   try {
-    const payload = await response.json();
-    return payload.error || payload.message || response.statusText;
+    return await response.json();
   } catch {
-    return response.statusText;
+    return { error: response.statusText };
   }
+}
+
+function readablePayloadMessage(payload: unknown, fallback: string) {
+  if (payload && typeof payload === "object") {
+    const record = payload as { diagnostic?: { message?: unknown }; error?: unknown; message?: unknown };
+    if (typeof record.diagnostic?.message === "string") return record.diagnostic.message;
+    if (typeof record.error === "string") return record.error;
+    if (typeof record.message === "string") return record.message;
+  }
+  return fallback;
 }

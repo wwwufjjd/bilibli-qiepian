@@ -5,6 +5,10 @@ dist/
 .playwright-mcp/
 .codegraph/
 .vite/
+.npm-cache/
+.pw-temp/
+playwright-report/
+test-results/
 *.log
 .env
 .env.*
