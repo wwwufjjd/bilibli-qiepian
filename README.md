@@ -1,163 +1,102 @@
 # Bilive Workbench
 
-<div align="center">
+本地用的 B 站直播工作台。把录制、素材库、预览剪辑、字幕、AI 切片和投稿草稿放在同一个页面里做。
 
-**B 站直播本地工作台：自动录制 · AI 切片 · 字幕 · 投稿预检**
+技术栈：React + Vite + Express。数据默认落在本机 `.workbench/`，不会跟着 git 走。
 
-不用在录播软件、剪辑软件、ASR 工具、投稿 CLI 之间来回切。  
-一个本地页面走完：**开播入库 → 高能切片 → 字幕封面 → 投稿草稿**。
+![素材库](docs/screenshots/library-overview.png)
 
-[![GitHub stars](https://img.shields.io/github/stars/wwwufjjd/bilibli-qiepian?style=social)](https://github.com/wwwufjjd/bilibli-qiepian)
-[![Vite](https://img.shields.io/badge/Vite-6-646CFF?logo=vite&logoColor=white)](https://vitejs.dev/)
-[![React](https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white)](https://react.dev/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-6-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![Node.js](https://img.shields.io/badge/Node.js-Express-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
-[![License](https://img.shields.io/badge/license-UNLICENSED-lightgrey)](#许可证)
+## 能干什么
 
-[功能导览](docs/feature-tour.md) · [验收报告](docs/verification-report.md) · [Issues](https://github.com/wwwufjjd/bilibli-qiepian/issues)
+- **按直播间录制**：加房间、开监控，开播录 FLV + 弹幕 XML，下播进素材库
+- **房间素材库**：按房间看视频/弹幕数量，进房间只处理这个主播的东西
+- **预览和切片**：MP4 直接播；FLV 可转封装或生成预览；时间线上能看弹幕密度
+- **字幕**：读已有字幕，也能跑 ASR（Fun-ASR / Qwen3 / 自定义命令 / 云端）
+- **AI 切片**：结合弹幕、字幕等信号出候选，带分数和理由；能接到自动导出/投稿草稿
+- **投稿**：整理分 P、生成/预检 biliup 命令；真正上传前会再确认一次
+- **任务中心**：录制、转码、ASR、自动化、投稿进度集中看
 
-</div>
+更细的界面说明在 [docs/feature-tour.md](docs/feature-tour.md)。
 
----
+## 怎么跑
 
-## 你是不是也在踩这些坑
-
-| 痛点 | 常见现状 | Bilive 怎么处理 |
-| --- | --- | --- |
-| 录完找不到片 | 录播堆在一堆文件夹里 | **按直播间**做素材库，封面 / 视频数 / 弹幕数一眼看到 |
-| 剪切片太慢 | 自己拖时间轴猜高能 | **弹幕密度 + 字幕 + 模型** 给少而准的候选和人话理由 |
-| 工具链太碎 | 录制 / ASR / 转码 / 投稿各一个软件 | **同一工作台**完成预览、字幕、导出、投稿草稿 |
-| 投稿容易翻车 | 命令行一把梭，缺分 P / Cookie / 标题 | **预检门禁 + 二次确认**，真实投稿前先看清楚 |
-| 磁盘被 FLV 吃满 | 手动一个个转 MP4 | 录制后自动 remux；批量转换默认 **stream copy**，可选 GPU 压缩 |
-
-> 本地优先：视频、Cookie、模型、草稿都在你自己电脑上的 `.workbench/`，默认不上传仓库。
-
----
-
-## 30 秒上手
-
-**Windows 双击：**
+Windows 可以直接：
 
 ```text
 setup.bat
 start.bat
 ```
 
-**或命令行：**
+或者：
 
 ```powershell
 npm install
 npm run dev
 ```
 
-浏览器打开本地地址（默认 `http://127.0.0.1:5173`），然后：
+浏览器打开 `http://127.0.0.1:5173`。
 
-1. **设置** → 确认录制目录、ffmpeg  
-2. **素材库** → 添加直播间 ID，打开「监控录制」  
-3. 主播下播 → 进房间 → AI 切片 / 字幕 / 导出  
-4. **投稿** → 预检通过后再确认执行  
+第一次建议先去 **设置**：
 
-可选增强：
+1. 填录制素材目录
+2. 确认本机有 `ffmpeg` / `ffprobe`
+3. 需要投稿再装 biliup、扫码出 Cookie
+4. 需要 AI 切片/ASR 再填模型和接口
+
+然后回素材库加直播间 ID，打开监控录制就行。
+
+可选：顺带装默认 Qwen3-ASR：
 
 ```powershell
-# 顺带准备默认 Qwen3-ASR 0.6B
 npm run setup:qwen
 ```
 
----
+## 我一般怎么用
 
-## 能力一览
+1. 加房间，打开自动录制  
+2. 播完进房间，需要的话先转 MP4 / 跑一段 ASR  
+3. 生成 AI 候选，不行的丢掉，好的导出  
+4. 到投稿页补标题分 P，预检过了再点执行  
 
-| 能力 | 开箱可用 | 说明 |
-| --- | --- | --- |
-| 多房间监控录制 | ✅ | 开播自动录 FLV + 弹幕 XML，下播入库 |
-| 房间素材库 | ✅ | 按房间聚合，支持隐藏目录（不删硬盘文件） |
-| 本地预览 | ✅ | MP4/MOV 直播；FLV 可生成预览或批量转封装 |
-| 弹幕时间线 | ✅ | 密度直方图、按时间筛弹幕 |
-| 字幕编辑 | ✅ | SRT/VTT/ASS + 手动补行 |
-| 区间 / 整片 ASR | ⚙️ | Fun-ASR、Qwen3-ASR-GGUF、自定义命令、云端接口 |
-| AI 高置信切片 | ⚙️ | 弹幕/字幕/画面/频谱信号；需配置视觉模型更稳 |
-| 自动切片流水线 | ⚙️ | 录完可排队分析、导出、生成投稿草稿；失败可重跑 |
-| 封面 / 标题 | ⚙️ | 抽帧；可选外部模型生成 |
-| 投稿草稿 + 预检 | ✅ | 分 P、Cookie、biliup 命令预检 |
-| 真实投稿 | ⚙️ | 需 biliup + 有效 Cookie + **二次确认** |
-| FLV 后处理 | ✅ | 默认 copy 快剪；可选 NVENC/QSV/AMF 归档压缩 |
-| 任务中心 | ✅ | 录制 / ASR / 转码 / 自动化 / 投稿统一查看 |
+FLV 批量转换默认是 **stream copy**（快，不重编码）。要压体积再在设置里切压缩；有 NVIDIA 时压缩可以走 NVENC。
 
-图例：`✅` 装好 Node + ffmpeg 就能用 · `⚙️` 按需接模型 / Cookie / 工具
-
----
-
-## 推荐工作流
-
-```text
-加房间 → 开监控录制
-    ↓ 开播自动写 FLV + 弹幕
-下播入库 → 进房间工作台
-    ↓ 可选：ASR / 预览 MP4
-AI 切片（少而准）→ 改标题 · 导出
-    ↓
-投稿页：分 P + 预检 → 确认后 biliup
-```
-
-设置里媒体转换有三档预设：
-
-| 预设 | 适合 | 策略 |
-| --- | --- | --- |
-| **快剪优先** | 当天剪切片 | 视频/音频 stream copy，可并发 |
-| **均衡** | 日常默认 | copy + 并发 2 |
-| **归档压缩** | 长期存盘 | H.264 压缩，输出到 `_compressed`，编码器可 `auto`（优先 NVENC） |
-
-录制链路建议：`remuxToMp4` 开着，保证下播后尽快有可剪 MP4；省空间再批量归档压缩。
-
----
+录制结束后如果开了「转封装 MP4」，会自动 remux 一份方便预览。
 
 ## 截图
 
-完整说明见 [docs/feature-tour.md](docs/feature-tour.md)。
-
-| 素材库 | 工作台 AI 切片 |
+| 工作台 | 弹幕 / 字幕 |
 | --- | --- |
-| ![素材库](docs/screenshots/library-overview.png) | ![AI 切片](docs/screenshots/feature-ai-clipping.png) |
+| ![AI 切片](docs/screenshots/feature-ai-clipping.png) | ![弹幕字幕](docs/screenshots/feature-danmaku-subtitles.png) |
 
-| 弹幕字幕 | 投稿预检 |
+| 投稿 | 任务 / 设置 |
 | --- | --- |
-| ![弹幕字幕](docs/screenshots/feature-danmaku-subtitles.png) | ![投稿](docs/screenshots/feature-upload-preflight.png) |
+| ![投稿](docs/screenshots/feature-upload-preflight.png) | ![设置](docs/screenshots/feature-settings-overview.png) |
 
-| 任务中心 | 设置 |
-| --- | --- |
-| ![任务](docs/screenshots/tasks-center.png) | ![设置](docs/screenshots/feature-settings-overview.png) |
+## 依赖
 
----
-
-## 环境要求
-
-| 依赖 | 是否必须 | 用途 |
+| 东西 | 要不要 | 干嘛的 |
 | --- | --- | --- |
-| **Node.js 18+** | 必须 | 前端 + 本地 Express |
-| **ffmpeg / ffprobe** | 必须 | 预览、切片、封面、FLV 处理 |
-| Python | 可选 | 本地 ASR、工作区安装 biliup |
-| biliup | 可选 | 投稿 / 追加分 P / 读稿件 |
-| 视觉 / ASR 模型接口 | 可选 | AI 切片、标题、语音识别 |
+| Node.js 18+ | 要 | 跑前端和本地服务 |
+| ffmpeg / ffprobe | 要 | 预览、切片、封面、转封装 |
+| Python | 可选 | 本地 ASR、装工作区 biliup |
+| biliup | 可选 | 投稿、追加分 P |
+| 视觉/ASR 接口 | 可选 | AI 切片、转写 |
 
-服务默认只监听 **`127.0.0.1`**，面向本机使用。
+服务只绑 `127.0.0.1`，按本机工具来用的。
 
----
+## 命令
 
-## 常用命令
+```powershell
+npm run dev            # 启动
+npm run build          # 构建
+npm run typecheck      # 类型检查
+npm run test:server    # 服务端测试
+npm run test:workflow  # 工作流回归
+npm run setup          # 装依赖
+npm run setup:qwen     # 依赖 + Qwen3-ASR
+```
 
-| 命令 | 说明 |
-| --- | --- |
-| `npm run dev` | 启动工作台 |
-| `npm run build` | 构建前端 |
-| `npm run typecheck` | TypeScript 检查 |
-| `npm run test:server` | 服务端测试 |
-| `npm run test:workflow` | 工作流回归汇总 |
-| `npm run setup` | 安装基础依赖 |
-| `npm run setup:qwen` | 依赖 + 默认 Qwen3-ASR |
-| `npm run start:workbench` | PowerShell 启动脚本 |
-
-真实直播 smoke（需指定当前开播房间）：
+真直播抽一段测录制（自己换房间号）：
 
 ```powershell
 $env:REAL_BILI_ROOM_ID="545068"
@@ -166,94 +105,22 @@ $env:REAL_BILI_REQUIRE_DANMAKU="1"
 npm run test:real-live-api
 ```
 
-更完整的验收证据见 [docs/verification-report.md](docs/verification-report.md)。
-
----
-
-## 你可能想知道
-
-**会不会把我的 Cookie / 视频传到别人服务器？**  
-默认不会。录制文件、工程草稿、Cookie、模型缓存在本地 `.workbench/`（已 gitignore）。只有你在设置里配置的**云端 ASR / 视觉接口**会按你填写的地址出站请求。
-
-**真实投稿安全吗？**  
-投稿有预检 + 策略门禁 + 前端二次确认；`confirm=true` 且用户明确执行才会跑 biliup。自动化默认倾向「生成草稿 / 人工复核」，而不是静默公开投稿。
-
-**和纯录播软件有什么区别？**  
-录播软件止于「录下来」。这里把**房间素材、剪切片、字幕、投稿准备**收成一条本地流水线，并尽量用「少而准」的 AI 候选减少人肉拖时间轴。
-
-**FLV 必须重编码吗？**  
-不必。批量转换默认 **stream copy**（快、画质不变）。要省盘再切「归档压缩」，有 NVIDIA 时可走 NVENC。
-
-**适合谁？**  
-自己录自己的直播、做切片二创、想少装几个工具的人。不是云端 SaaS，也不替代专业 NLE 精剪。
-
----
-
-## 目录结构
+## 目录
 
 ```text
-.
-├─ src/                 # React 工作台 UI
-├─ server/              # Express API、录制、ASR、投稿、媒体处理
-├─ scripts/             # Windows 安装 / 启动 / 冒烟脚本
-├─ docs/                # 功能导览、截图、验收
-├─ tests/               # 服务端与 Playwright 验收
-├─ .workbench/          # 本地数据（不入库）：录制缓存、模型、Cookie、草稿
-└─ README.md
+src/          前端
+server/       录制、媒体、ASR、投稿 API
+scripts/      安装和启动脚本
+docs/         功能导览和截图
+tests/        测试
+.workbench/   本机缓存（gitignore）
 ```
 
----
+## 注意
 
-## 设计原则
+- Cookie、视频、模型都在本地；只有你主动配置的云端接口才会出网
+- 真投稿需要 biliup + Cookie，并且页面上确认后才会跑
+- 现在许可证是 UNLICENSED，公开分发或商用前自己补协议
+- 代码里 `App.tsx` / `routes.mjs` 还很胖，后面打算拆；issue/PR 都欢迎
 
-1. **本地优先** — 素材与密钥留在本机  
-2. **房间是一等公民** — 不为「一个大文件夹」设计  
-3. **少而准** — AI 切片宁缺毋滥，并给出可核对的证据  
-4. **危险操作要门禁** — 真投稿、删配置、隐藏素材都要说清楚  
-5. **能 copy 就不重编码** — 速度优先，归档另说  
-
----
-
-## 路线图（欢迎 PR / Issue）
-
-- [ ] `/api/settings` 工具探测缓存（首屏再快一截）  
-- [ ] 进房视频列表元数据懒加载  
-- [ ] 播放进度状态局部化（长视频更顺）  
-- [ ] 设置首次使用向导  
-- [ ] 拆分巨型 `App.tsx` / `routes.mjs`  
-
-有 bug 或想法请开 [Issue](https://github.com/wwwufjjd/bilibli-qiepian/issues)。
-
----
-
-## 参与贡献
-
-```powershell
-git clone https://github.com/wwwufjjd/bilibli-qiepian.git
-cd bilibli-qiepian
-npm install
-npm run dev
-```
-
-改代码前建议：
-
-```powershell
-npm run typecheck
-npm run test:server
-```
-
----
-
-## 许可证
-
-当前仓库为 **UNLICENSED**。公开使用或二次分发前请先补充许可证；商用请先联系作者确认。
-
----
-
-## Star 一下？
-
-如果你也在做 B 站直播切片：录完找不到片、剪得慢、投稿前心里没底——这个项目就是为这种日常准备的。
-
-**点个 Star**，方便后面跟更新；平台接口或录制细节变了，我也会按自己在用的节奏继续修。
-
-[→ github.com/wwwufjjd/bilibli-qiepian](https://github.com/wwwufjjd/bilibli-qiepian)
+仓库：https://github.com/wwwufjjd/bilibli-qiepian
