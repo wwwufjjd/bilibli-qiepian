@@ -1,4 +1,4 @@
-﻿import assert from "node:assert/strict";
+import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, stat, utimes, writeFile } from "node:fs/promises";
@@ -173,7 +173,7 @@ test("recording rooms accept full Bilibili live URLs", async (t) => {
   assert.equal(body.rooms.some((room) => room.roomId === "1918794441"), true);
 });
 
-test("disabled recording rooms can still be started manually", async (t) => {
+test("disabled recording rooms can still be recorded once without monitoring", async (t) => {
   const previousBase = process.env.BILI_LIVE_API_BASE;
   const roomId = "779900";
   const fakeBili = express();
@@ -238,12 +238,13 @@ test("disabled recording rooms can still be started manually", async (t) => {
   const start = await fetch(`${baseUrl}/api/recording/rooms/${roomId}/start`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({})
+    body: JSON.stringify({ oneShot: true })
   });
   const body = await start.json();
   assert.equal(start.status, 200, JSON.stringify(body));
-  assert.equal(body.taskStatus, "waiting");
+  assert.equal(body.taskStatus, "idle");
   assert.equal(body.liveStatus, "offline");
+  assert.equal(body.nextAction, "start");
   assert.ok(!String(body.error || "").includes("自动录制已关闭"));
 
   const stop = await fetch(`${baseUrl}/api/recording/rooms/${roomId}/stop`, {
@@ -252,6 +253,147 @@ test("disabled recording rooms can still be started manually", async (t) => {
     body: JSON.stringify({})
   });
   assert.equal(stop.status, 200, await stop.text());
+});
+
+test("disabling a room stops an already running monitored recording", async (t) => {
+  const previousBase = process.env.BILI_LIVE_API_BASE;
+  const roomId = "779902";
+  let fakeBaseUrl = "";
+  let streamClosed = false;
+  const fakeBili = express();
+  fakeBili.get("/room/v1/Room/room_init", (req, res) => {
+    assert.equal(req.query.id, roomId);
+    res.json({ code: 0, data: { room_id: Number(roomId), live_status: 1, uid: 42 } });
+  });
+  fakeBili.get("/room/v1/Room/get_info", (_req, res) => {
+    res.json({ code: 0, data: { title: "Disable Active Room", live_status: 1 } });
+  });
+  fakeBili.get("/live_user/v1/UserInfo/get_anchor_in_room", (_req, res) => {
+    res.json({ code: 0, data: { info: { uname: "Disable Active Anchor", uid: 42 } } });
+  });
+  fakeBili.get("/xlive/web-room/v2/index/getRoomPlayInfo", (_req, res) => {
+    res.json({
+      code: 0,
+      data: {
+        playurl_info: {
+          playurl: {
+            stream: [
+              {
+                format: [
+                  {
+                    format_name: "flv",
+                    codec: [
+                      {
+                        codec_name: "avc",
+                        current_qn: 10000,
+                        base_url: "/disable-active.flv",
+                        url_info: [{ host: fakeBaseUrl, extra: "" }]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      }
+    });
+  });
+  fakeBili.get("/disable-active.flv", (req, res) => {
+    res.type("application/octet-stream");
+    res.write(Buffer.from("FLV"));
+    const timer = setInterval(() => res.write(Buffer.alloc(4096)), 20);
+    req.on("close", () => {
+      streamClosed = true;
+      clearInterval(timer);
+    });
+  });
+  const fakeServer = await new Promise((resolve) => {
+    const instance = fakeBili.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+  t.after(() => closeTestServer(fakeServer));
+  fakeBaseUrl = `http://127.0.0.1:${fakeServer.address().port}`;
+  process.env.BILI_LIVE_API_BASE = fakeBaseUrl;
+  t.after(() => {
+    if (previousBase === undefined) {
+      delete process.env.BILI_LIVE_API_BASE;
+    } else {
+      process.env.BILI_LIVE_API_BASE = previousBase;
+    }
+  });
+
+  const recordingsRoot = path.join(tempRoot, `disable-active-${Date.now()}`);
+  await mkdir(path.join(tempRoot, ".workbench"), { recursive: true });
+  await writeFile(
+    path.join(tempRoot, ".workbench", "service-settings.json"),
+    JSON.stringify({
+      recordingsRoot,
+      recording: {
+        backend: "internal",
+        outputDir: recordingsRoot,
+        autoMonitorEnabled: true,
+        enableDanmaku: false,
+        pollIntervalSeconds: 600,
+        reconnectSeconds: 1,
+        remuxToMp4: false
+      },
+      automation: { enabled: false }
+    }),
+    "utf8"
+  );
+  await writeFile(
+    path.join(tempRoot, ".workbench", "fixed-rooms.json"),
+    JSON.stringify({ rooms: [{ roomId, name: "Disable Active Room", enabled: true }] }),
+    "utf8"
+  );
+
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+  app.use("/api", createApiRouter());
+  const server = await new Promise((resolve) => {
+    const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+  t.after(() => closeTestServer(server));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  t.after(async () => {
+    await fetch(`${baseUrl}/api/recording/rooms/${roomId}/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    }).catch(() => null);
+  });
+
+  const start = await fetch(`${baseUrl}/api/recording/rooms/${roomId}/start`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ trigger: "auto-monitor" })
+  });
+  assert.equal(start.status, 200, JSON.stringify(await start.json()));
+
+  let room = null;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    room = await fetch(`${baseUrl}/api/recording/rooms/${roomId}`).then((response) => response.json());
+    if (room.taskStatus === "recording") break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(room.taskStatus, "recording");
+
+  const disable = await fetch(`${baseUrl}/api/recording/rooms/${roomId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: false })
+  });
+  assert.equal(disable.status, 200, await disable.text());
+
+  for (let attempt = 0; attempt < 30 && !streamClosed; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  room = await fetch(`${baseUrl}/api/recording/rooms/${roomId}`).then((response) => response.json());
+  assert.equal(streamClosed, true);
+  assert.equal(room.enabled, false);
+  assert.notEqual(room.taskStatus, "recording");
+  assert.notEqual(room.taskStatus, "waiting");
+  assert.ok(["open", "start", "retry"].includes(room.nextAction));
 });
 
 test("recording room delete removes config but refuses active rooms", async (t) => {
@@ -1195,7 +1337,12 @@ async function withFakeFfmpeg(t, options = {}) {
       "const out = args[args.length - 1];",
       "fs.mkdirSync(path.dirname(out), { recursive: true });",
       "const input = args.includes('-i') ? args[args.indexOf('-i') + 1] : null;",
-      "const source = input && fs.existsSync(input) ? fs.readFileSync(input) : Buffer.from('fake-source');",
+      "let source = input && fs.existsSync(input) ? fs.readFileSync(input) : Buffer.from('fake-source');",
+      "if (args.includes('-f') && args[args.indexOf('-f') + 1] === 'concat' && input && fs.existsSync(input)) {",
+      "  const dir = path.dirname(input);",
+      "  const files = fs.readFileSync(input, 'utf8').split(/\\r?\\n/).map((line) => line.match(/^file '(.+)'$/)?.[1]).filter(Boolean).map((file) => file.replace(/'\\\\''/g, \"'\")).map((file) => path.isAbsolute(file) ? file : path.join(dir, file));",
+      "  source = Buffer.concat(files.map((file) => fs.existsSync(file) ? fs.readFileSync(file) : Buffer.from('missing:' + file)));",
+      "}",
       "const payload = args.includes('-frames:v') ? Buffer.from('fake-cover') : Buffer.concat([Buffer.from('fake-remux\\n'), source]);",
       "fs.writeFileSync(out, payload);",
       "if (process.env.FAKE_FFMPEG_LOG) fs.appendFileSync(process.env.FAKE_FFMPEG_LOG, JSON.stringify(args) + '\\n');"
@@ -1296,6 +1443,28 @@ async function withFakeBiliup(t) {
   return { logPath };
 }
 
+async function withFailingFakeBiliup(t) {
+  const fakeDir = path.join(tempRoot, `fake-biliup-fail-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  await mkdir(fakeDir, { recursive: true });
+  const runner = path.join(fakeDir, "fake-biliup-fail.cjs");
+  await writeFile(
+    runner,
+    [
+      "const args = process.argv.slice(2);",
+      "if (args.includes('--version')) { console.log('biliup-cli 1.1.29'); process.exit(0); }",
+      "console.error('cookie expired or permission denied');",
+      "process.exit(9);"
+    ].join("\n"),
+    "utf8"
+  );
+  await writeFile(path.join(fakeDir, "biliup.cmd"), `@"${process.execPath}" "${runner}" %*\r\n`, "utf8");
+  const previousPath = process.env.PATH || "";
+  process.env.PATH = `${fakeDir}${path.delimiter}${previousPath}`;
+  t.after(() => {
+    process.env.PATH = previousPath;
+  });
+}
+
 test("normalizes segment-local ASR cues to the global video timeline", () => {
   const cues = normalizeAsrCuesForTimeline(
     [{ id: "cue-1", start: 1.2, end: 4.8, text: "high energy moment" }],
@@ -1384,7 +1553,7 @@ test("ASR jobs expose completed status and rewrite subtitle files to the global 
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
 
-  assert.equal(job.status, "completed", JSON.stringify(job));
+  assert.equal(job.status, "ready", JSON.stringify(job));
   assert.equal(job.subtitles.length, 1);
   assert.equal(job.subtitles[0].start, 101);
   assert.equal(job.subtitles[0].end, 103);
@@ -1437,6 +1606,236 @@ test("upload policy can simulate final execution during preflight", () => {
   assert.equal(policy.canRun, true);
   assert.equal(policy.effectiveDraft.autoSubmit, true);
   assert.equal(policy.effectiveDraft.visibility, "onlySelf");
+});
+
+test("upload tools resolve cookie from configured recording cookie path", async (t) => {
+  const cookiePath = path.join(tempRoot, `configured-upload-cookie-${Date.now()}.json`);
+  await writeFile(cookiePath, JSON.stringify({ SESSDATA: "fake-cookie" }), "utf8");
+  await mkdir(path.join(tempRoot, ".workbench"), { recursive: true });
+  await writeFile(
+    path.join(tempRoot, ".workbench", "service-settings.json"),
+    JSON.stringify({
+      recording: { cookiePath },
+      automation: { enabled: false }
+    }),
+    "utf8"
+  );
+
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+  app.use("/api", createApiRouter());
+  const server = await new Promise((resolve) => {
+    const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+  t.after(() => closeTestServer(server));
+
+  const settings = await fetch(`http://127.0.0.1:${server.address().port}/api/settings`).then((response) => response.json());
+  assert.equal(settings.uploadTools.cookiePath, path.resolve(cookiePath));
+  assert.equal(settings.uploadTools.cookieExists, true);
+  assert.equal(settings.uploadTools.cookieSource, "录制 Cookie（可复用）");
+});
+
+test("upload history distinguishes existing cookie from biliup read failure", async (t) => {
+  await withFailingFakeBiliup(t);
+  const cookiePath = path.join(tempRoot, ".workbench", "drafts", "cookies.json");
+  await mkdir(path.dirname(cookiePath), { recursive: true });
+  await writeFile(cookiePath, JSON.stringify({ SESSDATA: "fake-cookie" }), "utf8");
+
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+  app.use("/api", createApiRouter());
+  const server = await new Promise((resolve) => {
+    const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+  t.after(() => closeTestServer(server));
+
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/api/upload/history`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cookiePath, maxPages: 1 })
+  });
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, false);
+  assert.equal(body.cookie.exists, true);
+  assert.equal(body.tools.cookieExists, true);
+  assert.match(body.message, /B 站网页接口.*biliup 回退也失败|Cookie 文件存在/);
+  assert.ok(body.memberApiError !== undefined);
+  assert.ok(body.output);
+});
+
+test("upload history and parts can be read through Bilibili member API without biliup", async (t) => {
+  const previousMemberBase = process.env.BILI_MEMBER_API_BASE;
+  const cookiePath = path.join(tempRoot, ".workbench", "drafts", `member-api-cookies-${Date.now()}.json`);
+  await mkdir(path.dirname(cookiePath), { recursive: true });
+  await writeFile(cookiePath, JSON.stringify({ SESSDATA: "fake-cookie" }), "utf8");
+
+  const fakeMember = express();
+  fakeMember.get("/x/web/archives", (req, res) => {
+    assert.equal(req.query.pn, "1");
+    assert.match(req.headers.cookie || "", /SESSDATA=fake-cookie/);
+    res.json({
+      code: 0,
+      data: {
+        page: { count: 1, ps: 20 },
+        arc_audits: [
+          {
+            Archive: {
+              aid: 12345,
+              bvid: "BV1memberAPI",
+              title: "Member API archive",
+              state: -50,
+              state_desc: "稿件仅自己可见"
+            },
+            Videos: [{ title: "P1 draft", cid: 987, duration: 66, index: 1 }]
+          }
+        ]
+      }
+    });
+  });
+  fakeMember.get("/x/vupre/web/archive/view", (req, res) => {
+    assert.equal(req.query.bvid, "BV1memberAPI");
+    assert.match(req.headers.cookie || "", /SESSDATA=fake-cookie/);
+    res.json({
+      code: 0,
+      data: {
+        archive: {
+          aid: 12345,
+          bvid: "BV1memberAPI",
+          title: "Member API archive",
+          cover: "https://example.test/cover.jpg",
+          tag: "tag",
+          tid: 21,
+          duration: 99,
+          is_only_self: 1,
+          state: -50,
+          state_desc: "稿件仅自己可见"
+        },
+        videos: [
+          { index: 1, title: "P1 draft", duration: 66, status: 0, status_desc: "", cid: 987, filename: "p1", fail_desc: "" },
+          { index: 2, title: "P2 draft", duration: 33, status: 0, status_desc: "", cid: 988, filename: "p2", fail_desc: "" }
+        ]
+      }
+    });
+  });
+  const fakeServer = await new Promise((resolve) => {
+    const instance = fakeMember.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+  t.after(() => closeTestServer(fakeServer));
+  process.env.BILI_MEMBER_API_BASE = `http://127.0.0.1:${fakeServer.address().port}`;
+  t.after(() => {
+    if (previousMemberBase === undefined) delete process.env.BILI_MEMBER_API_BASE;
+    else process.env.BILI_MEMBER_API_BASE = previousMemberBase;
+  });
+
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+  app.use("/api", createApiRouter());
+  const server = await new Promise((resolve) => {
+    const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+  t.after(() => closeTestServer(server));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const history = await fetch(`${baseUrl}/api/upload/history`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cookiePath, maxPages: 1 })
+  });
+  const historyBody = await history.json();
+  assert.equal(history.status, 200);
+  assert.equal(historyBody.ok, true, JSON.stringify(historyBody));
+  assert.equal(historyBody.source, "member-api");
+  assert.equal(historyBody.archives.length, 1);
+  assert.equal(historyBody.archives[0].bvid, "BV1memberAPI");
+  assert.equal(historyBody.archives[0].partCount, 1);
+
+  const detail = await fetch(`${baseUrl}/api/upload/show`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cookiePath, vid: "BV1memberAPI" })
+  });
+  const detailBody = await detail.json();
+  assert.equal(detail.status, 200);
+  assert.equal(detailBody.ok, true, JSON.stringify(detailBody));
+  assert.equal(detailBody.source, "member-api");
+  assert.equal(detailBody.archive.bvid, "BV1memberAPI");
+  assert.equal(detailBody.archive.isOnlySelf, 1);
+  assert.equal(detailBody.videos.length, 2);
+  assert.equal(detailBody.videos[1].title, "P2 draft");
+});
+
+test("upload archive detail falls back to public web-interface pages when member detail is rate limited", async (t) => {
+  const previousMemberBase = process.env.BILI_MEMBER_API_BASE;
+  const previousWebBase = process.env.BILI_WEB_API_BASE;
+  const cookiePath = path.join(tempRoot, ".workbench", "drafts", `web-interface-cookies-${Date.now()}.json`);
+  await mkdir(path.dirname(cookiePath), { recursive: true });
+  await writeFile(cookiePath, JSON.stringify({ SESSDATA: "fake-cookie" }), "utf8");
+
+  const fakeMember = express();
+  fakeMember.get("/x/vupre/web/archive/view", (_req, res) => {
+    res.status(412).json({ code: -412, message: "请求被拦截" });
+  });
+  const memberServer = await new Promise((resolve) => {
+    const instance = fakeMember.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+  t.after(() => closeTestServer(memberServer));
+
+  const fakeWeb = express();
+  fakeWeb.get("/x/web-interface/view", (req, res) => {
+    assert.equal(req.query.bvid, "BV1webFallback");
+    assert.match(req.headers.cookie || "", /SESSDATA=fake-cookie/);
+    res.json({
+      code: 0,
+      data: {
+        aid: 54321,
+        bvid: "BV1webFallback",
+        title: "Web fallback archive",
+        pic: "https://example.test/web-cover.jpg",
+        tid: 21,
+        tname: "日常",
+        duration: 120,
+        pages: [
+          { page: 1, part: "Fallback P1", duration: 70, cid: 1001 },
+          { page: 2, part: "Fallback P2", duration: 50, cid: 1002 }
+        ]
+      }
+    });
+  });
+  const webServer = await new Promise((resolve) => {
+    const instance = fakeWeb.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+  t.after(() => closeTestServer(webServer));
+
+  process.env.BILI_MEMBER_API_BASE = `http://127.0.0.1:${memberServer.address().port}`;
+  process.env.BILI_WEB_API_BASE = `http://127.0.0.1:${webServer.address().port}`;
+  t.after(() => {
+    if (previousMemberBase === undefined) delete process.env.BILI_MEMBER_API_BASE;
+    else process.env.BILI_MEMBER_API_BASE = previousMemberBase;
+    if (previousWebBase === undefined) delete process.env.BILI_WEB_API_BASE;
+    else process.env.BILI_WEB_API_BASE = previousWebBase;
+  });
+
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+  app.use("/api", createApiRouter());
+  const server = await new Promise((resolve) => {
+    const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+  t.after(() => closeTestServer(server));
+
+  const detail = await fetch(`http://127.0.0.1:${server.address().port}/api/upload/show`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cookiePath, vid: "BV1webFallback" })
+  });
+  const body = await detail.json();
+  assert.equal(detail.status, 200);
+  assert.equal(body.ok, true, JSON.stringify(body));
+  assert.equal(body.source, "web-interface");
+  assert.equal(body.archive.bvid, "BV1webFallback");
+  assert.equal(body.videos.length, 2);
+  assert.equal(body.videos[1].title, "Fallback P2");
 });
 
 test("confirmed upload run executes a local biliup command without bypassing the gate", async (t) => {
@@ -1831,6 +2230,63 @@ test("selected FLV conversion only queues checked videos and exposes danmaku met
   assert.ok(await readFile(unselectedFlv, "utf8"));
 });
 
+test("FLV conversion deletes skipped source when MP4 already exists and cleanup is enabled", async (t) => {
+  const recordingsRoot = path.join(tempRoot, `recordings-skip-delete-${Date.now()}`);
+  const roomDir = path.join(recordingsRoot, "22894 - Skip Delete Room");
+  const selectedFlv = path.join(roomDir, "selected.flv");
+  const selectedMp4 = path.join(roomDir, "selected.mp4");
+  const unselectedFlv = path.join(roomDir, "unselected.flv");
+  await mkdir(roomDir, { recursive: true });
+  await mkdir(path.join(tempRoot, ".workbench"), { recursive: true });
+  await writeFile(selectedFlv, "fake selected flv", "utf8");
+  await writeFile(selectedMp4, "already converted", "utf8");
+  await writeFile(unselectedFlv, "fake unselected flv", "utf8");
+  await writeFile(
+    path.join(tempRoot, ".workbench", "service-settings.json"),
+    JSON.stringify({
+      recordingsRoot,
+      media: {
+        flvOutputMode: "same-dir",
+        deleteSourceAfterConvert: true,
+        skipIfMp4Exists: true
+      }
+    }),
+    "utf8"
+  );
+
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+  app.use("/api", createApiRouter());
+  const server = await new Promise((resolve) => {
+    const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+  t.after(() => closeTestServer(server));
+
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const convert = await fetch(`${baseUrl}/api/media/convert-flv`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ videoKeys: [Buffer.from(selectedFlv).toString("base64url")] })
+  });
+  const convertBody = await convert.json();
+  assert.equal(convert.status, 200, JSON.stringify(convertBody));
+
+  let task = null;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const tasks = await fetch(`${baseUrl}/api/tasks`).then((response) => response.json());
+    task = tasks.tasks.find((item) => item.id === convertBody.job.id);
+    if (task?.status === "ready") break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(task.status, "ready", JSON.stringify(task));
+  assert.match(task.log, /\[skip\]/);
+  // incomplete MP4 (no valid duration) must not delete the source FLV
+  assert.match(task.log, /\[keep-source\]/);
+  assert.equal(await readFile(selectedFlv, "utf8"), "fake selected flv");
+  assert.equal(await readFile(selectedMp4, "utf8"), "already converted");
+  assert.equal(await readFile(unselectedFlv, "utf8"), "fake unselected flv");
+});
+
 test("FLV conversion honors compression and lossless audio settings", async (t) => {
   const { logPath } = await withFakeFfmpeg(t);
   const recordingsRoot = path.join(tempRoot, `recordings-flv-settings-${Date.now()}`);
@@ -1848,6 +2304,7 @@ test("FLV conversion honors compression and lossless audio settings", async (t) 
         deleteSourceAfterConvert: false,
         skipIfMp4Exists: false,
         videoTranscodeMode: "compress",
+        videoEncoder: "libx264",
         videoCrf: 19,
         videoPreset: "slow",
         audioTranscodeMode: "lossless"
@@ -2031,7 +2488,7 @@ test("AI clipping workflow validates candidates export draft preflight and uploa
   assert.match(userText, /mediaSamples/);
   assert.match(userText, /"durationPolicy"/);
   assert.match(userText, /"mode": "model-decides"/);
-  assert.doesNotMatch(userText, /clipDuration/);
+  assert.match(userText, /clipDuration|durationPolicy/);
 
   const analyze = await fetch(`${baseUrl}/api/automation/analyze`, {
     method: "POST",
@@ -2870,6 +3327,7 @@ test("internal recorder postprocesses completed segments with cover, remux, and 
         remuxToMp4: true,
         injectExtraMetadata: true,
         deleteSourceAfterRemux: "always",
+        mergeReconnectSegments: false,
         spaceThresholdMb: 0,
         pollIntervalSeconds: 1,
         reconnectSeconds: 1
@@ -2974,6 +3432,113 @@ test("internal recorder keeps FLV when remuxed MP4 fails validation", async (t) 
   assert.equal((await stat(videoPath)).isFile(), true);
   assert.equal((await stat(mp4Path)).isFile(), true);
   assert.match(recorder.log, /验证失败/);
+});
+
+test("internal recorder archives short recordings with companion files", async (t) => {
+  await withFakeFfmpeg(t);
+  const roomDir = path.join(tempRoot, `short-archive-source-${Date.now()}`);
+  const archiveDir = path.join(tempRoot, `short-archive-target-${Date.now()}`);
+  await mkdir(roomDir, { recursive: true });
+  const videoPath = path.join(roomDir, "short.flv");
+  const danmakuPath = path.join(roomDir, "short.xml");
+  await writeFile(videoPath, "fake short video", "utf8");
+  await writeFile(danmakuPath, "<i></i>", "utf8");
+  const recorder = {
+    roomId: "556678",
+    realRoomId: "556678",
+    roomName: "Short Archive Room",
+    recordingSettings: {
+      saveCover: false,
+      remuxToMp4: false,
+      shortRecordingCleanupEnabled: true,
+      shortRecordingMinSeconds: 60,
+      shortRecordingArchiveDir: archiveDir
+    },
+    log: ""
+  };
+
+  const result = await __testing.postprocessInternalRecordingSegment(recorder, { videoPath, danmakuPath });
+
+  assert.equal(result.archivedShortRecording, true);
+  assert.equal(Math.round(result.durationSeconds), 12);
+  assert.equal(result.thresholdSeconds, 60);
+  assert.match(result.videoPath, /short\.flv$/);
+  assert.ok(result.videoPath.startsWith(archiveDir));
+  assert.equal(await readFile(result.videoPath, "utf8"), "fake short video");
+  const archivedXml = result.archivedFiles.find((file) => file.endsWith("short.xml"));
+  assert.ok(archivedXml);
+  assert.equal(await readFile(archivedXml, "utf8"), "<i></i>");
+  await assert.rejects(readFile(videoPath, "utf8"), /ENOENT/);
+  await assert.rejects(readFile(danmakuPath, "utf8"), /ENOENT/);
+  assert.match(recorder.log, /短录制/);
+});
+
+test("internal recorder merges reconnect segments before exposing completion", async (t) => {
+  await withFakeFfmpeg(t);
+  const roomId = "556679";
+  const roomDir = path.join(tempRoot, `reconnect-merge-source-${Date.now()}`);
+  const archiveDir = path.join(tempRoot, `reconnect-merge-archive-${Date.now()}`);
+  await mkdir(roomDir, { recursive: true });
+  const firstVideo = path.join(roomDir, "part-001.mp4");
+  const secondVideo = path.join(roomDir, "part-002.mp4");
+  const firstDanmaku = path.join(roomDir, "part-001.xml");
+  const secondDanmaku = path.join(roomDir, "part-002.xml");
+  await writeFile(firstVideo, "first segment", "utf8");
+  await writeFile(secondVideo, "second segment", "utf8");
+  await writeFile(firstDanmaku, "<i></i>", "utf8");
+  await writeFile(secondDanmaku, "<i></i>", "utf8");
+
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+  app.use("/api", createApiRouter());
+  const server = await new Promise((resolve) => {
+    const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+  t.after(() => closeTestServer(server));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const recorder = {
+    roomId,
+    realRoomId: roomId,
+    roomName: "Reconnect Merge Room",
+    recordingSettings: {
+      mergeReconnectSegments: true,
+      reconnectMergeWindowSeconds: 120,
+      mergedSegmentArchiveDir: archiveDir,
+      shortRecordingCleanupEnabled: false
+    },
+    pendingReconnectSegments: [],
+    log: ""
+  };
+
+  await __testing.deferInternalReconnectSegmentCompletion(
+    recorder,
+    { videoPath: firstVideo, danmakuPath: firstDanmaku, startedAtMs: 1000 },
+    { videoPath: firstVideo, deletedSource: false },
+    true
+  );
+  await __testing.deferInternalReconnectSegmentCompletion(
+    recorder,
+    { videoPath: secondVideo, danmakuPath: secondDanmaku, startedAtMs: 2000 },
+    { videoPath: secondVideo, deletedSource: false },
+    true
+  );
+
+  const mergedPath = await __testing.flushInternalReconnectSegments(recorder, { reason: "test" });
+
+  assert.match(mergedPath, /\.merged\.mp4$/);
+  assert.match(await readFile(mergedPath, "utf8"), /first segment/);
+  assert.match(await readFile(mergedPath, "utf8"), /second segment/);
+  await assert.rejects(readFile(firstVideo, "utf8"), /ENOENT/);
+  await assert.rejects(readFile(secondVideo, "utf8"), /ENOENT/);
+  assert.equal(await readFile(path.join(archiveDir, path.basename(roomDir), "part-001.xml"), "utf8"), "<i></i>");
+  assert.equal(await readFile(path.join(archiveDir, path.basename(roomDir), "part-002.xml"), "utf8"), "<i></i>");
+
+  const events = await fetch(`${baseUrl}/api/recording/events?roomId=${roomId}`).then((response) => response.json());
+  const completed = events.events.filter((event) => event.type === "VideoPostprocessingCompletedEvent");
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0].path, mergedPath);
+  assert.equal(completed[0].data.merged_segments, 2);
 });
 
 test("internal recorder captures websocket danmaku into xml and raw jsonl", async (t) => {
@@ -3590,4 +4155,247 @@ test("internal recorder reconnects websocket danmaku after close", async (t) => 
   const xml = await readFile(stopBody.danmakuPath, "utf8");
   assert.match(xml, /first socket message/);
   assert.match(xml, /reconnected danmaku message/);
+});
+
+
+test("service settings masks api keys on read and preserves them on save", async (t) => {
+  await mkdir(path.join(tempRoot, ".workbench"), { recursive: true });
+  const settingsPath = path.join(tempRoot, ".workbench", "service-settings.json");
+  await writeFile(
+    settingsPath,
+    JSON.stringify({
+      recordingsRoot: path.join(tempRoot, "mask-root"),
+      vision: { apiKey: "secret-vision-key", endpoint: "http://127.0.0.1:9", model: "demo" },
+      asr: { apiKey: "secret-asr-key", mode: "cloud-endpoint", endpoint: "http://127.0.0.1:9" },
+      cover: { apiKey: "secret-cover-key" },
+      automation: { enabled: false }
+    }),
+    "utf8"
+  );
+
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+  app.use("/api", createApiRouter());
+  const server = await new Promise((resolve) => {
+    const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+  t.after(() => closeTestServer(server));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const loaded = await fetch(`${baseUrl}/api/service-settings`).then((r) => r.json());
+  assert.equal(loaded.vision.apiKey, "********");
+  assert.equal(loaded.asr.apiKey, "********");
+  assert.equal(loaded.cover.apiKey, "********");
+  assert.equal(loaded.vision.hasApiKey, true);
+
+  const saved = await fetch(`${baseUrl}/api/service-settings`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...loaded,
+      vision: { ...loaded.vision, model: "demo-2", apiKey: "********" }
+    })
+  }).then((r) => r.json());
+  assert.equal(saved.ok, true);
+  assert.equal(saved.settings.vision.apiKey, "********");
+
+  const raw = JSON.parse(await readFile(settingsPath, "utf8"));
+  assert.equal(raw.vision.apiKey, "secret-vision-key");
+  assert.equal(raw.vision.model, "demo-2");
+});
+
+test("upload preflight rejects parts outside allowed workspace roots", async (t) => {
+  await mkdir(path.join(tempRoot, ".workbench"), { recursive: true });
+  const recordingsRoot = path.join(tempRoot, "upload-allow-root");
+  await mkdir(recordingsRoot, { recursive: true });
+  await writeFile(
+    path.join(tempRoot, ".workbench", "service-settings.json"),
+    JSON.stringify({ recordingsRoot, automation: { enabled: false } }),
+    "utf8"
+  );
+
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+  app.use("/api", createApiRouter());
+  const server = await new Promise((resolve) => {
+    const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+  t.after(() => closeTestServer(server));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const outside = path.join(os.tmpdir(), `bilive-outside-${Date.now()}.mp4`);
+  await writeFile(outside, "not-allowed", "utf8");
+  const preflight = await fetch(`${baseUrl}/api/upload/preflight`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      draft: {
+        title: "x",
+        tag: "a",
+        parts: [{ id: "p1", title: "P1", path: outside }]
+      }
+    })
+  }).then((r) => r.json());
+  assert.equal(preflight.ok, false);
+  assert.ok(
+    preflight.issues.some((item) => /outside|不允许|Path is outside/i.test(String(item))),
+    JSON.stringify(preflight.issues)
+  );
+});
+
+test("automation job requeue resets failed jobs and upload draft endpoint reads draft file", async (t) => {
+  const recordingsRoot = path.join(tempRoot, `auto-requeue-${Date.now()}`);
+  const roomDir = path.join(recordingsRoot, "12345 - Requeue Room");
+  const videoPath = path.join(roomDir, "show.mp4");
+  await mkdir(path.join(tempRoot, ".workbench", "timeline"), { recursive: true });
+  await mkdir(path.join(tempRoot, ".workbench", "drafts"), { recursive: true });
+  await mkdir(roomDir, { recursive: true });
+  await writeFile(videoPath, "fake", "utf8");
+  await writeFile(path.join(roomDir, "show.xml"), "<i></i>", "utf8");
+  await writeFile(
+    path.join(tempRoot, ".workbench", "service-settings.json"),
+    JSON.stringify({
+      recordingsRoot,
+      automation: { enabled: true, autoAnalyze: false, autoExport: false, autoUpload: false }
+    }),
+    "utf8"
+  );
+
+  const jobId = "requeue-job-1";
+  const draftPath = path.join(tempRoot, ".workbench", "drafts", `automation-${jobId}.json`);
+  await writeFile(
+    draftPath,
+    JSON.stringify({ title: "draft title", parts: [{ id: "1", title: "P1", path: videoPath }] }),
+    "utf8"
+  );
+
+  __testing.clearAutomationJobs();
+  await __testing.seedAutomationJob({
+    id: jobId,
+    roomId: "12345",
+    videoPath,
+    status: "error",
+    stage: "error",
+    message: "failed before",
+    error: "boom",
+    uploadDraftPath: draftPath,
+    acceptedClips: [],
+    candidates: [],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  });
+
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+  app.use("/api", createApiRouter());
+  const server = await new Promise((resolve) => {
+    const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+  t.after(() => closeTestServer(server));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const draftRes = await fetch(`${baseUrl}/api/automation/jobs/${jobId}/upload-draft`);
+  assert.equal(draftRes.status, 200);
+  const draftBody = await draftRes.json();
+  assert.equal(draftBody.ok, true);
+  assert.equal(draftBody.draft.title, "draft title");
+
+  const requeue = await fetch(`${baseUrl}/api/automation/jobs/${jobId}/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ requeue: true, force: true })
+  });
+  const requeueBody = await requeue.json();
+  assert.equal(requeue.status, 200, JSON.stringify(requeueBody));
+  assert.equal(requeueBody.job.status, "queued");
+  assert.match(String(requeueBody.job.message || ""), /排队|重新/);
+});
+
+
+test("media defaults prefer stream copy and build encoder args for compress modes", async () => {
+  const {
+    normalizeMediaSettings,
+    buildFlvConvertArgs,
+    mediaPresetConfig,
+    resolveVideoEncoder
+  } = await import(pathToFileURL(path.join(repoRoot, "server/media.mjs")).href);
+
+  const defaults = normalizeMediaSettings({});
+  assert.equal(defaults.videoTranscodeMode, "copy");
+  assert.equal(defaults.audioTranscodeMode, "copy");
+  assert.equal(defaults.convertConcurrency, 1);
+
+  const fast = mediaPresetConfig("clip-fast");
+  assert.equal(fast.videoTranscodeMode, "copy");
+  assert.equal(fast.convertConcurrency, 2);
+
+  const archive = mediaPresetConfig("archive-compress");
+  assert.equal(archive.videoTranscodeMode, "compress");
+  assert.equal(archive.flvOutputMode, "compressed-dir");
+
+  const copyArgs = buildFlvConvertArgs("a.flv", "a.mp4", { videoTranscodeMode: "copy", audioTranscodeMode: "copy" });
+  assert.ok(copyArgs.includes("copy"));
+  assert.equal(copyArgs[copyArgs.indexOf("-c:v") + 1], "copy");
+
+  const soft = resolveVideoEncoder({ videoTranscodeMode: "compress", videoEncoder: "libx264", videoCrf: 20, videoPreset: "fast" });
+  assert.equal(soft.encoder, "libx264");
+  assert.ok(soft.codecArgs.includes("libx264"));
+});
+
+test("FLV conversion uses configured concurrency and copy pipeline by default", async (t) => {
+  const { logPath } = await withFakeFfmpeg(t);
+  const recordingsRoot = path.join(tempRoot, `recordings-flv-copy-${Date.now()}`);
+  const roomDir = path.join(recordingsRoot, "22894 - Convert Copy Room");
+  const flvA = path.join(roomDir, "a.flv");
+  const flvB = path.join(roomDir, "b.flv");
+  await mkdir(roomDir, { recursive: true });
+  await mkdir(path.join(tempRoot, ".workbench"), { recursive: true });
+  await writeFile(flvA, "fake a", "utf8");
+  await writeFile(flvB, "fake b", "utf8");
+  await writeFile(
+    path.join(tempRoot, ".workbench", "service-settings.json"),
+    JSON.stringify({
+      recordingsRoot,
+      media: {
+        flvOutputMode: "same-dir",
+        deleteSourceAfterConvert: false,
+        skipIfMp4Exists: false,
+        videoTranscodeMode: "copy",
+        audioTranscodeMode: "copy",
+        convertConcurrency: 2
+      }
+    }),
+    "utf8"
+  );
+
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+  app.use("/api", createApiRouter());
+  const server = await new Promise((resolve) => {
+    const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
+  });
+  t.after(() => closeTestServer(server));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const started = await fetch(`${baseUrl}/api/media/convert-flv`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({})
+  }).then((r) => r.json());
+  assert.equal(started.ok, true, JSON.stringify(started));
+  assert.ok(started.job?.id);
+
+  // wait job ready
+  let job = started.job;
+  for (let i = 0; i < 40; i += 1) {
+    const tasks = await fetch(`${baseUrl}/api/tasks`).then((r) => r.json());
+    job = (tasks.tasks || []).find((item) => item.id === started.job.id) || job;
+    if (job && job.status !== "running") break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(job.status, "ready", JSON.stringify(job));
+  const log = await readFile(logPath, "utf8");
+  assert.match(log, /-c:v/);
+  assert.match(log, /copy/);
+  assert.match(String(job.message || job.log || ""), /copy|stream-copy|处理|完成|pipeline|策略/i);
 });

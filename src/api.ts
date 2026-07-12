@@ -57,6 +57,7 @@ export function requestSliceCandidates(body: {
   videoKey: string;
   sources: string[];
   clipCount: number;
+  clipDuration?: number;
   precisionMode?: "high" | "recall" | string;
   subtitles?: SubtitleCue[];
   danmakuEdits?: Record<string, string>;
@@ -92,8 +93,36 @@ export function analyzeVideoAutomation(body: { videoKey: string; uploadPolicy?: 
   return postJson<{ ok: boolean; job: AutomationJob }>("/api/automation/analyze", body);
 }
 
+export function analyzeAllRecordingsAutomation(body: { limit?: number } = {}) {
+  return postJson<{
+    ok: boolean;
+    jobs: AutomationJob[];
+    queued: number;
+    scanned: number;
+    skippedActive: number;
+    skippedExisting: number;
+    skippedRecent: number;
+    skippedNoDanmaku: number;
+    runnerStarted: boolean;
+  }>("/api/automation/analyze-all", body);
+}
+
 export function runAutomationJob(jobId: string) {
   return postJson<{ ok: boolean; job: AutomationJob }>(`/api/automation/jobs/${encodeURIComponent(jobId)}/run`, {});
+}
+
+
+export function loadUploadDraft(path?: string) {
+  const query = path ? `?path=${encodeURIComponent(path)}` : '';
+  return getJson<{ ok: boolean; path: string; draft: UploadDraft }>(`/api/upload/draft${query}`);
+}
+
+export function loadAutomationUploadDraft(jobId: string) {
+  return getJson<{ ok: boolean; path: string; draft: UploadDraft; job: AutomationJob }>(`/api/automation/jobs/${encodeURIComponent(jobId)}/upload-draft`);
+}
+
+export function requeueAutomationJob(jobId: string, body: Record<string, unknown> = {}) {
+  return postJson<{ ok: boolean; job: AutomationJob }>(`/api/automation/jobs/${encodeURIComponent(jobId)}/run`, { requeue: true, ...body });
 }
 
 export function runRecordingMonitorSweep() {
@@ -159,11 +188,11 @@ export function deleteMaterialRoom(roomKey: string) {
   });
 }
 
-export async function postRecordingRoomAction(roomId: string, action: "start" | "stop" | "retry") {
+export async function postRecordingRoomAction(roomId: string, action: "start" | "stop" | "retry", body: Record<string, unknown> = {}) {
   const response = await fetch(`/api/recording/rooms/${encodeURIComponent(roomId)}/${action}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({})
+    body: JSON.stringify(body)
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {

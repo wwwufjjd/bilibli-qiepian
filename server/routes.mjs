@@ -13,9 +13,12 @@ import mime from "mime-types";
 import WebSocket from "ws";
 import {
   buildFlvConvertArgs,
+  describeMediaPipeline,
+  detectHwEncoders,
   getFfprobeInvocation,
   getFlvTargetPath,
   getFfmpegInvocation,
+  mediaPresetConfig,
   normalizeMediaSettings
 } from "./media.mjs";
 
@@ -28,6 +31,8 @@ const projectsDir = path.join(workbenchRoot, "projects");
 const exportsDir = path.join(workbenchRoot, "exports");
 const draftsDir = path.join(workbenchRoot, "drafts");
 const previewsDir = path.join(workbenchRoot, "previews");
+const shortRecordingsDir = path.join(workbenchRoot, "short-recordings");
+const mergedSegmentsDir = path.join(workbenchRoot, "merged-segments");
 const modelAssetsDir = path.join(workbenchRoot, "model-assets");
 const coversDir = path.join(workbenchRoot, "covers");
 const asrDir = path.join(workbenchRoot, "asr");
@@ -41,6 +46,7 @@ const fixedRoomsPath = path.join(workbenchRoot, "fixed-rooms.json");
 const hiddenMaterialRoomsPath = path.join(workbenchRoot, "hidden-material-rooms.json");
 const recordingVerificationPath = path.join(workbenchRoot, "recording-verification.json");
 const biliupVenvDir = path.join(toolsDir, "biliup-venv");
+const recommendedBiliupVersion = "1.2.1";
 const asrVenvDir = path.join(toolsDir, "asr-venv");
 const funasrRunnerPath = path.join(process.cwd(), "server", "funasr_runner.py");
 const serviceSettingsPath = path.join(workbenchRoot, "service-settings.json");
@@ -96,6 +102,11 @@ let recordingMonitorNextRunAt = null;
 let recordingMonitorActivated = false;
 let automationReconcileLastAt = 0;
 let automationReconcileRunning = false;
+let automationBulkRunnerActive = false;
+const automationBulkQueue = [];
+const automationRunningJobs = new Set();
+const automationJobPromises = new Map();
+const danmakuWriteQueues = new Map();
 let biliWbiKeyCache = null;
 
 const biliWbiMixinKeyEncTab = [
@@ -134,7 +145,7 @@ export function createApiRouter() {
       ffprobe: commandExists("ffprobe"),
       uploadTools: getUploadTools(),
       uploadDefaults: getUploadDefaults(),
-      serviceSettings,
+      serviceSettings: publicServiceSettings(serviceSettings),
       asrTools: getLocalAsrStatus(),
       recording: {
         recorder: getInternalRecorderHealth(serviceSettings.recording),
@@ -146,7 +157,7 @@ export function createApiRouter() {
 
   router.get("/service-settings", async (_req, res) => {
     try {
-      res.json(await readServiceSettings());
+      res.json(publicServiceSettings(await readServiceSettings()));
     } catch (error) {
       res.status(500).json({ error: readableError(error) });
     }
@@ -179,14 +190,39 @@ export function createApiRouter() {
       const roomPath = findRoomPath(videoPath);
       const roomFiles = collectFiles(roomPath, 2);
       const room = parseRoomName(path.basename(roomPath), roomFiles, roomPath);
-      const job = await createAutomationJob({
+      const force = Boolean(req.body?.force || req.body?.requeue);
+      let job = await createAutomationJob({
         roomId: room.roomId,
         videoPath,
         trigger: "manual",
-        uploadPolicy: req.body.uploadPolicy || settings.automation.uploadPolicy
+        uploadPolicy: req.body.uploadPolicy || settings.automation.uploadPolicy,
+        force
       });
-      void runAutomationJob(job.id).catch((error) => markAutomationJobError(job.id, error));
-      res.json({ ok: true, job });
+      if (force || job.status === "error" || job.status === "ready") {
+        job = await requeueAutomationJob(job.id, {
+          uploadPolicy: req.body.uploadPolicy || settings.automation.uploadPolicy,
+          force: true
+        });
+      }
+      startAutomationBulkRunner([job.id]);
+      res.json({ ok: true, job: automationJobs.get(job.id) || job });
+    } catch (error) {
+      res.status(500).json({ error: readableError(error) });
+    }
+  });
+
+  router.post("/automation/analyze-all", async (req, res) => {
+    try {
+      const limit = Math.max(0, Math.min(1000, Number(req.body?.limit || 0)));
+      const result = await queueAutomationJobsFromRecordings({
+        force: true,
+        recentOnly: false,
+        limit,
+        trigger: "manual-all",
+        runQueued: true,
+        requeueFailed: Boolean(req.body?.requeueFailed)
+      });
+      res.json({ ok: true, ...result });
     } catch (error) {
       res.status(500).json({ error: readableError(error) });
     }
@@ -194,8 +230,52 @@ export function createApiRouter() {
 
   router.post("/automation/jobs/:jobId/run", async (req, res) => {
     try {
+      if (req.body?.requeue || req.body?.force) {
+        const job = await requeueAutomationJob(req.params.jobId, req.body || {});
+        startAutomationBulkRunner([job.id]);
+        res.json({ ok: true, job });
+        return;
+      }
       const job = await runAutomationJob(req.params.jobId, req.body || {});
       res.json({ ok: true, job });
+    } catch (error) {
+      res.status(500).json({ error: readableError(error) });
+    }
+  });
+
+  router.get("/automation/jobs/:jobId/upload-draft", async (req, res) => {
+    try {
+      await loadAutomationJobs();
+      const job = automationJobs.get(String(req.params.jobId));
+      if (!job) {
+        res.status(404).json({ error: "自动切片任务不存在。" });
+        return;
+      }
+      if (!job.uploadDraftPath || !fs.existsSync(job.uploadDraftPath)) {
+        res.status(404).json({ error: "这个任务还没有投稿草稿文件。" });
+        return;
+      }
+      assertAllowedFile(job.uploadDraftPath);
+      const draft = JSON.parse(await fsp.readFile(job.uploadDraftPath, "utf8"));
+      res.json({ ok: true, path: job.uploadDraftPath, draft, job: publicAutomationJob(job) });
+    } catch (error) {
+      res.status(500).json({ error: readableError(error) });
+    }
+  });
+
+  router.get("/upload/draft", async (req, res) => {
+    try {
+      const requested = String(req.query.path || "").trim();
+      const file = requested
+        ? path.resolve(requested)
+        : path.join(draftsDir, "latest-upload-draft.json");
+      assertAllowedFile(file);
+      if (!fs.existsSync(file)) {
+        res.status(404).json({ error: "投稿草稿不存在。" });
+        return;
+      }
+      const draft = JSON.parse(await fsp.readFile(file, "utf8"));
+      res.json({ ok: true, path: file, draft });
     } catch (error) {
       res.status(500).json({ error: readableError(error) });
     }
@@ -351,6 +431,11 @@ export function createApiRouter() {
       rooms[index] = normalizeFixedRoom({ ...rooms[index], ...(req.body || {}), roomId: rooms[index].roomId });
       await writeFixedRooms(rooms);
       if (rooms[index].enabled === false) {
+        const recorder = internalRecorders.get(rooms[index].roomId);
+        if (recorder) {
+          recorder.monitorAfterFinish = false;
+          await stopInternalBiliRecorder(rooms[index].roomId);
+        }
         stopIdleInternalRoomMonitor(rooms[index].roomId);
         stopRoomLiveMonitor(rooms[index].roomId);
         const assets = await scanRecordingAssetsForRoom(rooms[index].roomId);
@@ -469,10 +554,12 @@ export function createApiRouter() {
 
   router.post("/service-settings", async (req, res) => {
     try {
-      const settings = normalizeServiceSettings(req.body);
+      const current = await readServiceSettings();
+      const mergedBody = restoreMaskedServiceSecrets(req.body || {}, current);
+      const settings = normalizeServiceSettings(mergedBody);
       await fsp.writeFile(serviceSettingsPath, JSON.stringify(settings, null, 2), "utf8");
       applyRecordingMonitorSettings(settings.recording);
-      res.json({ ok: true, settings });
+      res.json({ ok: true, settings: publicServiceSettings(settings) });
     } catch (error) {
       res.status(500).json({ error: readableError(error) });
     }
@@ -692,6 +779,20 @@ export function createApiRouter() {
     }
   });
 
+  
+  router.get("/media/pipeline", async (_req, res) => {
+    try {
+      const settings = await readServiceSettings();
+      res.json({ ok: true, pipeline: describeMediaPipeline(settings.media || {}), presets: {
+        "clip-fast": mediaPresetConfig("clip-fast"),
+        balanced: mediaPresetConfig("balanced"),
+        "archive-compress": mediaPresetConfig("archive-compress")
+      } });
+    } catch (error) {
+      res.status(500).json({ error: readableError(error) });
+    }
+  });
+
   router.post("/media/convert-flv", async (req, res) => {
     try {
       const settings = await readServiceSettings();
@@ -822,7 +923,7 @@ export function createApiRouter() {
         res.status(501).json({
           ok: false,
           message: "未检测到 biliup。请先安装本地 biliup，再启动扫码登录。",
-          suggestedCommands: ["python -m venv .workbench/tools/biliup-venv", ".workbench/tools/biliup-venv/Scripts/python.exe -m pip install biliup==1.1.29"]
+          suggestedCommands: ["python -m venv .workbench/tools/biliup-venv", `.workbench/tools/biliup-venv/Scripts/python.exe -m pip install biliup==${recommendedBiliupVersion}`]
         });
         return;
       }
@@ -913,20 +1014,25 @@ function makeCliEnv(extra = {}) {
 
 function getUploadTools() {
   const systemBiliupPath = commandPath("biliup");
-  const localBiliupPath = getLocalBiliupPath();
+  const localBiliup = getLocalBiliupInvocation();
+  const localBiliupPath = localBiliup?.executablePath || null;
   const biliupPath = systemBiliupPath || localBiliupPath;
+  const biliupArgsPrefix = systemBiliupPath ? [] : localBiliup?.argsPrefix || [];
   const bilitoolPath = commandPath("bilitool");
-  const cookiePath = path.join(draftsDir, "cookies.json");
+  const cookie = resolveUploadCookiePath();
   return {
     biliup: Boolean(biliupPath),
     bilitool: Boolean(bilitoolPath),
     biliupPath,
     bilitoolPath,
     biliupSource: systemBiliupPath ? "system" : localBiliupPath ? "workspace" : null,
-    biliupVersion: biliupPath ? commandOutput(biliupPath, ["--version"]) : null,
-    testedBiliupVersion: "1.1.29",
-    cookiePath,
-    cookieExists: fs.existsSync(cookiePath),
+    biliupArgsPrefix,
+    biliupVersion: biliupPath ? commandOutput(biliupPath, [...biliupArgsPrefix, "--version"]) : null,
+    testedBiliupVersion: recommendedBiliupVersion,
+    cookiePath: cookie.path,
+    cookieExists: cookie.exists,
+    cookieSource: cookie.source,
+    cookieCandidates: cookie.candidates,
     workspaceInstallPath: biliupVenvDir,
     capabilities: {
       uploadMultiPart: true,
@@ -940,9 +1046,58 @@ function getUploadTools() {
   };
 }
 
-function getLocalBiliupPath() {
+function resolveUploadCookiePath(preferredPath = "") {
+  const raw = readRawServiceSettingsSync();
+  const defaultsPath = path.join(draftsDir, "cookies.json");
+  const candidates = [];
+  const addCandidate = (value, source) => {
+    const rawPath = String(value || "").trim();
+    if (!rawPath) return;
+    const resolved = path.resolve(rawPath);
+    try {
+      assertAllowedFile(resolved);
+    } catch {
+      return;
+    }
+    if (candidates.some((candidate) => candidate.path === resolved)) return;
+    candidates.push({
+      path: resolved,
+      exists: fs.existsSync(resolved),
+      source
+    });
+  };
+
+  addCandidate(preferredPath, "草稿指定");
+  addCandidate(raw?.upload?.cookiePath, "投稿 Cookie");
+  addCandidate(raw?.recording?.cookiePath, "录制 Cookie（可复用）");
+  addCandidate(defaultsPath, "默认投稿 Cookie");
+  addCandidate(path.join(workbenchRoot, "cookies.json"), "工作区 Cookie");
+
+  const selected = candidates.find((candidate) => candidate.exists) || candidates[0] || {
+    path: defaultsPath,
+    exists: false,
+    source: "默认投稿 Cookie"
+  };
+  return {
+    path: selected.path,
+    exists: selected.exists,
+    source: selected.source,
+    candidates
+  };
+}
+
+function getLocalBiliupInvocation() {
+  const python = path.join(biliupVenvDir, "Scripts", "python.exe");
+  if (fs.existsSync(python)) return { executablePath: python, argsPrefix: ["-m", "biliup"] };
   const exe = path.join(biliupVenvDir, "Scripts", "biliup.exe");
-  return fs.existsSync(exe) ? exe : null;
+  return fs.existsSync(exe) ? { executablePath: exe, argsPrefix: [] } : null;
+}
+
+function getBiliupInvocation(tools = getUploadTools()) {
+  return {
+    executablePath: tools.biliupPath,
+    argsPrefix: Array.isArray(tools.biliupArgsPrefix) ? tools.biliupArgsPrefix : []
+  };
 }
 
 function getUploadDefaults() {
@@ -1112,6 +1267,38 @@ function preferredVideoRank(extension) {
   if (ext === ".ts") return 4;
   if (ext === ".avi") return 5;
   return 9;
+}
+
+function restoreMaskedServiceSecrets(input = {}, current = {}) {
+  const next = JSON.parse(JSON.stringify(input || {}));
+  const restore = (sectionName) => {
+    const section = next[sectionName] || {};
+    const prev = current[sectionName] || {};
+    const key = String(section.apiKey || "");
+    if (!key || key === "********" || key.includes("*")) {
+      section.apiKey = prev.apiKey || "";
+    }
+    next[sectionName] = section;
+  };
+  restore("asr");
+  restore("vision");
+  restore("cover");
+  return next;
+}
+
+function publicServiceSettings(settings) {
+  const clone = JSON.parse(JSON.stringify(settings || {}));
+  const mask = (section) => {
+    if (!section || typeof section !== "object") return;
+    if (typeof section.apiKey === "string" && section.apiKey) {
+      section.hasApiKey = true;
+      section.apiKey = "********";
+    }
+  };
+  mask(clone.asr);
+  mask(clone.vision);
+  mask(clone.cover);
+  return clone;
 }
 
 async function readServiceSettings() {
@@ -1339,7 +1526,7 @@ function normalizeVisionWireApi(value) {
 }
 
 function normalizeAutomationSettings(input = {}) {
-  const rawSources = Array.isArray(input.sources) && input.sources.length ? input.sources : ["danmaku", "subtitle"];
+  const rawSources = Array.isArray(input.sources) && input.sources.length ? input.sources : ["danmaku"];
   const sources = rawSources.map((item) => String(item)).filter((item) => ["danmaku", "subtitle", "visual", "audio"].includes(item));
   return {
     enabled: Boolean(input.enabled),
@@ -1350,7 +1537,7 @@ function normalizeAutomationSettings(input = {}) {
     uploadPolicy: normalizeUploadPolicy({ uploadPolicy: input.uploadPolicy || "review" }),
     clipDuration: Math.max(20, Math.min(600, Number(input.clipDuration || 90))),
     clipCount: Math.max(1, Math.min(6, Number(input.clipCount || 3))),
-    sources: sources.length ? sources : ["danmaku", "subtitle"],
+    sources: sources.length ? sources : ["danmaku"],
     minScore: Math.max(1, Math.min(100, Number(input.minScore || 72))),
     minEvidenceCount: Math.max(1, Math.min(10, Number(input.minEvidenceCount || 2))),
     requireHighConfidence: input.requireHighConfidence !== false,
@@ -1413,6 +1600,12 @@ function normalizeRecordingSettings(input = {}, recordingsRoot = getRecordingsRo
     remuxToMp4: input.remuxToMp4 !== false,
     injectExtraMetadata: input.injectExtraMetadata !== false,
     deleteSourceAfterRemux: normalizeDeleteSourceStrategy(input.deleteSourceAfterRemux || input.deleteSource || "always"),
+    mergeReconnectSegments: input.mergeReconnectSegments !== false,
+    reconnectMergeWindowSeconds: Math.max(0, Math.min(3600, Number(input.reconnectMergeWindowSeconds || 120))),
+    mergedSegmentArchiveDir: String(input.mergedSegmentArchiveDir || mergedSegmentsDir),
+    shortRecordingCleanupEnabled: Boolean(input.shortRecordingCleanupEnabled),
+    shortRecordingMinSeconds: Math.max(0, Math.min(3600, Number(input.shortRecordingMinSeconds || 60))),
+    shortRecordingArchiveDir: String(input.shortRecordingArchiveDir || shortRecordingsDir),
     spaceCheckIntervalSeconds: Number.isFinite(spaceCheckIntervalSeconds) ? Math.max(0, Math.min(600, Math.round(spaceCheckIntervalSeconds))) : 60,
     spaceThresholdMb: Number.isFinite(spaceThresholdMb) ? Math.max(0, Math.min(1024 * 1024, Math.round(spaceThresholdMb))) : 1024,
     recycleRecords: Boolean(input.recycleRecords)
@@ -1768,6 +1961,8 @@ function setRoomRuntimeStatus(roomId, patch) {
 export const __testing = {
   createInternalRecordingPaths,
   postprocessInternalRecordingSegment,
+  flushInternalReconnectSegments,
+  deferInternalReconnectSegmentCompletion,
   getRoomRuntimeStatus,
   setRoomRuntimeStatus,
   resetAutomationReconcileClock() {
@@ -1775,6 +1970,21 @@ export const __testing = {
   },
   clearRoomRuntimeStatus(roomId) {
     recordingRoomStatuses.delete(String(roomId));
+  },
+  clearAutomationJobs() {
+    automationJobs.clear();
+    automationBulkQueue.length = 0;
+    automationRunningJobs.clear();
+    automationBulkRunnerActive = false;
+  },
+  detectHwEncoders,
+  describeMediaPipeline,
+  mediaPresetConfig,
+  async seedAutomationJob(job) {
+    const normalized = normalizeAutomationJob(job);
+    automationJobs.set(normalized.id, normalized);
+    await persistAutomationJobs();
+    return automationJobs.get(normalized.id);
   }
 };
 
@@ -1916,6 +2126,9 @@ function statusPatchFromRecordingEvent(event) {
   if (/RecordingFinishedEvent|PostprocessingCompletedEvent/.test(event.type)) {
     return { liveStatus: "offline", taskStatus: "completed", message: "录制完成，可剪辑", nextAction: "open", refreshed: true, ...pathPatch };
   }
+  if (/ShortRecordingArchivedEvent/.test(event.type)) {
+    return { liveStatus: "offline", taskStatus: "completed", message: "短录制已归档", nextAction: "start", refreshed: true };
+  }
   if (/RecordingCancelledEvent|Error/.test(event.type)) {
     return { taskStatus: "error", message: "录制事件报告异常", nextAction: "retry", ...pathPatch };
   }
@@ -1939,6 +2152,7 @@ function pathPatchFromRecordingEvent(event, stat) {
 async function maybeQueueAutomationFromRecordingEvent(event) {
   if (!event.path || !videoExtensions.has(path.extname(event.path).toLowerCase())) return null;
   if (!/VideoFileCompletedEvent|VideoPostprocessingCompletedEvent|PostprocessingCompletedEvent/.test(event.type)) return null;
+  if (event.type === "VideoFileCompletedEvent" && event.data?.backend === "internal" && event.data?.postprocess_pending) return null;
   const settings = await readServiceSettings();
   if (!settings.automation.enabled) return null;
   if (settings.automation.triggerOnRecordingComplete === false) return null;
@@ -1975,18 +2189,30 @@ async function loadAutomationJobs() {
 
 async function persistAutomationJobs() {
   await fsp.mkdir(path.dirname(automationJobsPath), { recursive: true });
-  await fsp.writeFile(
-    automationJobsPath,
-    JSON.stringify({ jobs: [...automationJobs.values()], updatedAt: new Date().toISOString() }, null, 2),
-    "utf8"
-  );
+  const tempPath = `${automationJobsPath}.${process.pid}.tmp`;
+  const payload = JSON.stringify({ jobs: [...automationJobs.values()], updatedAt: new Date().toISOString() }, null, 2);
+  await fsp.writeFile(tempPath, payload, "utf8");
+  await fsp.rename(tempPath, automationJobsPath);
+}
+
+function publicAutomationJob(job) {
+  if (!job) return null;
+  return normalizeAutomationJob(job);
 }
 
 async function createAutomationJob(input) {
   await loadAutomationJobs();
   const resolvedVideoPath = path.resolve(input.videoPath);
   const existing = [...automationJobs.values()].find((job) => path.resolve(job.videoPath) === resolvedVideoPath);
-  if (existing) return existing;
+  if (existing && !input.force) return existing;
+  if (existing && input.force) {
+    return requeueAutomationJob(existing.id, {
+      uploadPolicy: input.uploadPolicy,
+      force: true,
+      trigger: input.trigger,
+      triggerEventId: input.triggerEventId
+    });
+  }
   const now = new Date().toISOString();
   const id = crypto.createHash("sha1").update(`${resolvedVideoPath}:${input.trigger || ""}:${input.triggerEventId || ""}:${now}`).digest("hex").slice(0, 16);
   const job = normalizeAutomationJob({
@@ -1998,7 +2224,7 @@ async function createAutomationJob(input) {
     uploadPolicy: normalizeUploadPolicy({ uploadPolicy: input.uploadPolicy || "review" }),
     status: "queued",
     stage: "queued",
-    message: "Queued for high-confidence clip analysis.",
+    message: "已排队，等待高置信切片分析。",
     candidates: [],
     acceptedClips: [],
     exportedClips: [],
@@ -2011,6 +2237,197 @@ async function createAutomationJob(input) {
   return job;
 }
 
+async function requeueAutomationJob(jobId, overrides = {}) {
+  await loadAutomationJobs();
+  const job = automationJobs.get(String(jobId));
+  if (!job) throw new Error(`自动切片任务不存在：${jobId}`);
+  if (automationRunningJobs.has(job.id) && !overrides.force) {
+    throw new Error("这个自动切片任务正在运行，请稍后再重试。");
+  }
+  Object.assign(job, {
+    status: "queued",
+    stage: "queued",
+    message: "已重新排队，等待高置信切片分析。",
+    error: "",
+    uploadPolicy: normalizeUploadPolicy({ uploadPolicy: overrides.uploadPolicy || job.uploadPolicy || "review" }),
+    trigger: overrides.trigger || job.trigger || "manual-requeue",
+    triggerEventId: overrides.triggerEventId || job.triggerEventId || null,
+    candidates: [],
+    acceptedClips: [],
+    exportedClips: [],
+    uploadDraftPath: null,
+    uploadPreflight: null,
+    uploadJobId: null,
+    projectPath: job.projectPath || null,
+    updatedAt: new Date().toISOString()
+  });
+  automationJobs.set(job.id, job);
+  await persistAutomationJobs();
+  return job;
+}
+
+function getActiveRecordingVideoPathSet() {
+  const activePaths = new Set();
+  for (const recorder of internalRecorders.values()) {
+    if (recorder?.segment?.videoPath) activePaths.add(path.resolve(recorder.segment.videoPath));
+  }
+  for (const status of recordingRoomStatuses.values()) {
+    if (["recording", "starting", "finalizing"].includes(String(status.taskStatus || "")) && status.recordingPath) {
+      activePaths.add(path.resolve(status.recordingPath));
+    }
+  }
+  return activePaths;
+}
+
+async function collectAutomationRecordingFiles({ recentOnly = true, limit = 6, requeueFailed = false } = {}) {
+  await loadAutomationJobs();
+  const recordingsRoot = getRecordingsRoot();
+  if (!recordingsRoot || !fs.existsSync(recordingsRoot)) {
+    return { files: [], scanned: 0, skippedActive: 0, skippedExisting: 0, skippedRecent: 0, skippedNoDanmaku: 0 };
+  }
+  const now = Date.now();
+  const activePaths = getActiveRecordingVideoPathSet();
+  const existingByPath = new Map(
+    [...automationJobs.values()].map((job) => [path.resolve(job.videoPath), job])
+  );
+  const staleMs = 60_000;
+  const recentMs = 48 * 60 * 60 * 1000;
+  const candidates = dedupeVideoFiles(collectFiles(recordingsRoot, 3).filter((file) => videoExtensions.has(path.extname(file).toLowerCase())))
+    .map((file) => ({ file: path.resolve(file), stat: safeStat(file) }))
+    .filter((item) => item.stat?.isFile?.())
+    .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
+  const result = [];
+  const skipped = {
+    scanned: candidates.length,
+    skippedActive: 0,
+    skippedExisting: 0,
+    skippedRecent: 0,
+    skippedNoDanmaku: 0
+  };
+  for (const item of candidates) {
+    if (now - item.stat.mtimeMs < staleMs) {
+      skipped.skippedActive += 1;
+      continue;
+    }
+    if (recentOnly && now - item.stat.mtimeMs > recentMs) {
+      skipped.skippedRecent += 1;
+      continue;
+    }
+    if (activePaths.has(item.file)) {
+      skipped.skippedActive += 1;
+      continue;
+    }
+    const existing = existingByPath.get(item.file);
+    if (existing) {
+      if (requeueFailed && existing.status === "error") {
+        result.push({ ...item, roomPath: findRoomPath(item.file), roomFiles: collectFiles(findRoomPath(item.file), 2), requeueJobId: existing.id });
+        if (limit > 0 && result.length >= limit) break;
+        continue;
+      }
+      skipped.skippedExisting += 1;
+      continue;
+    }
+    const roomPath = findRoomPath(item.file);
+    const roomFiles = collectFiles(roomPath, 2);
+    const xmlFiles = roomFiles.filter((file) => path.extname(file).toLowerCase() === ".xml");
+    const xml = findCompanionFile(item.file, xmlFiles, ".xml");
+    if (!xml) {
+      skipped.skippedNoDanmaku += 1;
+      continue;
+    }
+    result.push({ ...item, roomPath, roomFiles });
+    if (limit > 0 && result.length >= limit) break;
+  }
+  return { files: result, ...skipped };
+}
+
+async function queueAutomationJobsFromRecordings({ force = false, recentOnly = true, limit = 6, trigger = "recording-file-reconcile", runQueued = false, requeueFailed = false } = {}) {
+  const settings = await readServiceSettings();
+  if (!force && (!settings.automation.enabled || settings.automation.triggerOnRecordingComplete === false)) {
+    return { jobs: [], queued: 0, scanned: 0, skippedActive: 0, skippedExisting: 0, skippedRecent: 0, skippedNoDanmaku: 0, runnerStarted: false };
+  }
+  const scan = await collectAutomationRecordingFiles({ recentOnly, limit, requeueFailed });
+  const jobs = [];
+  for (const item of scan.files) {
+    if (item.requeueJobId) {
+      const job = await requeueAutomationJob(item.requeueJobId, {
+        uploadPolicy: settings.automation.uploadPolicy,
+        force: true,
+        trigger,
+        triggerEventId: `${trigger}:${crypto.createHash("sha1").update(item.file).digest("hex").slice(0, 16)}`
+      });
+      jobs.push(job);
+      continue;
+    }
+    const room = parseRoomName(path.basename(item.roomPath), item.roomFiles, item.roomPath);
+    const job = await createAutomationJob({
+      roomId: room.roomId,
+      videoPath: item.file,
+      trigger,
+      triggerEventId: `${trigger}:${crypto.createHash("sha1").update(item.file).digest("hex").slice(0, 16)}`,
+      uploadPolicy: settings.automation.uploadPolicy
+    });
+    jobs.push(job);
+  }
+  let runnerStarted = false;
+  if (runQueued || settings.automation.autoAnalyze) {
+    const queuedIds = jobs.filter((job) => job.status === "queued").map((job) => job.id);
+    runnerStarted = startAutomationBulkRunner(queuedIds);
+  }
+  return {
+    jobs,
+    queued: jobs.filter((job) => job.status === "queued").length,
+    scanned: scan.scanned,
+    skippedActive: scan.skippedActive,
+    skippedExisting: scan.skippedExisting,
+    skippedRecent: scan.skippedRecent,
+    skippedNoDanmaku: scan.skippedNoDanmaku,
+    runnerStarted
+  };
+}
+
+function enqueueAutomationJobIds(jobIds = []) {
+  let added = 0;
+  for (const rawId of jobIds) {
+    const jobId = String(rawId || "").trim();
+    if (!jobId) continue;
+    if (automationBulkQueue.includes(jobId) || automationRunningJobs.has(jobId)) continue;
+    automationBulkQueue.push(jobId);
+    added += 1;
+  }
+  return added;
+}
+
+function startAutomationBulkRunner(jobIds = []) {
+  const uniqueIds = [...new Set(jobIds.map(String).filter(Boolean))];
+  const added = enqueueAutomationJobIds(uniqueIds);
+  if (!uniqueIds.length && !automationBulkQueue.length) return false;
+  if (automationBulkRunnerActive) return added > 0 || automationBulkQueue.length > 0;
+  automationBulkRunnerActive = true;
+  void (async () => {
+    try {
+      while (automationBulkQueue.length) {
+        const jobId = automationBulkQueue.shift();
+        await loadAutomationJobs();
+        const job = automationJobs.get(jobId);
+        if (!job || job.status !== "queued") continue;
+        if (automationRunningJobs.has(jobId)) continue;
+        try {
+          await runAutomationJob(jobId);
+        } catch (error) {
+          await markAutomationJobError(jobId, error);
+        }
+      }
+    } finally {
+      automationBulkRunnerActive = false;
+      if (automationBulkQueue.length) {
+        startAutomationBulkRunner([]);
+      }
+    }
+  })();
+  return true;
+}
+
 async function reconcileAutomationJobsFromRecordings({ force = false } = {}) {
   if (automationReconcileRunning) return [];
   const now = Date.now();
@@ -2018,51 +2435,8 @@ async function reconcileAutomationJobsFromRecordings({ force = false } = {}) {
   automationReconcileLastAt = now;
   automationReconcileRunning = true;
   try {
-    await loadAutomationJobs();
-    const settings = await readServiceSettings();
-    if (!settings.automation.enabled || settings.automation.triggerOnRecordingComplete === false) return [];
-    const recordingsRoot = getRecordingsRoot();
-    if (!recordingsRoot || !fs.existsSync(recordingsRoot)) return [];
-    const activePaths = new Set();
-    for (const recorder of internalRecorders.values()) {
-      if (recorder?.segment?.videoPath) activePaths.add(path.resolve(recorder.segment.videoPath));
-    }
-    for (const status of recordingRoomStatuses.values()) {
-      if (["recording", "starting", "finalizing"].includes(String(status.taskStatus || "")) && status.recordingPath) {
-        activePaths.add(path.resolve(status.recordingPath));
-      }
-    }
-    const existingPaths = new Set([...automationJobs.values()].map((job) => path.resolve(job.videoPath)));
-    const staleMs = 60_000;
-    const recentMs = 48 * 60 * 60 * 1000;
-    const files = dedupeVideoFiles(collectFiles(recordingsRoot, 3).filter((file) => videoExtensions.has(path.extname(file).toLowerCase())))
-      .map((file) => ({ file: path.resolve(file), stat: safeStat(file) }))
-      .filter((item) => item.stat?.isFile?.())
-      .filter((item) => now - item.stat.mtimeMs >= staleMs && now - item.stat.mtimeMs <= recentMs)
-      .filter((item) => !activePaths.has(item.file) && !existingPaths.has(item.file))
-      .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs)
-      .slice(0, 6);
-    const queued = [];
-    for (const item of files) {
-      const roomPath = findRoomPath(item.file);
-      const roomFiles = collectFiles(roomPath, 2);
-      const room = parseRoomName(path.basename(roomPath), roomFiles, roomPath);
-      const xmlFiles = roomFiles.filter((file) => path.extname(file).toLowerCase() === ".xml");
-      const xml = findCompanionFile(item.file, xmlFiles, ".xml");
-      if (!xml) continue;
-      const job = await createAutomationJob({
-        roomId: room.roomId,
-        videoPath: item.file,
-        trigger: "recording-file-reconcile",
-        triggerEventId: `reconcile:${crypto.createHash("sha1").update(item.file).digest("hex").slice(0, 16)}`,
-        uploadPolicy: settings.automation.uploadPolicy
-      });
-      queued.push(job);
-      if (settings.automation.autoAnalyze && job.status === "queued") {
-        void runAutomationJob(job.id).catch((error) => markAutomationJobError(job.id, error));
-      }
-    }
-    return queued;
+    const result = await queueAutomationJobsFromRecordings({ force, recentOnly: true, limit: 6, trigger: "recording-file-reconcile" });
+    return result.jobs;
   } finally {
     automationReconcileRunning = false;
   }
@@ -2095,91 +2469,136 @@ function normalizeAutomationJob(job) {
 }
 
 async function runAutomationJob(jobId, overrides = {}) {
+  const id = String(jobId);
+  if (automationJobPromises.has(id) && !overrides.force) {
+    return automationJobPromises.get(id);
+  }
+  let resolveOuter;
+  let rejectOuter;
+  const runPromise = new Promise((resolve, reject) => {
+    resolveOuter = resolve;
+    rejectOuter = reject;
+  });
+  automationJobPromises.set(id, runPromise);
+  void (async () => {
+  try {
   await loadAutomationJobs();
-  const job = automationJobs.get(String(jobId));
-  if (!job) throw new Error(`Automation job not found: ${jobId}`);
-  const settings = await readServiceSettings();
-  const automation = { ...settings.automation, ...(overrides.automation || {}) };
-  Object.assign(job, {
-    status: "running",
-    stage: "analyzing",
-    message: "Analyzing danmaku/subtitle signals for high-confidence clips.",
-    error: "",
-    updatedAt: new Date().toISOString()
-  });
-  await persistAutomationJobs();
-
-  const context = await getVideoContext(job.videoPath);
-  const localCandidates = buildSliceCandidates(context, {
-    sources: automation.sources,
-    clipCount: automation.clipCount,
-    precisionMode: "high"
-  });
-  const candidates = await enhanceSliceCandidatesWithModel(context, automation, localCandidates, settings);
-  const acceptedClips = candidates
-    .filter((candidate) => passesAutomationClipPolicy(candidate, automation))
-    .slice(0, automation.clipCount)
-    .map((candidate) => ({
-      ...candidate,
-      status: "draft",
-      uploadPolicy: job.uploadPolicy,
-      automation: candidate.automation
-    }));
-
-  let finalClips = acceptedClips;
-  let projectPath = await writeAutomationProjectDraft(job.videoPath, finalClips);
-  let uploadDraftPath = null;
-  let uploadPreflight = null;
-  let uploadJobId = null;
-  let exportedClips = [];
-  let stage = finalClips.length ? "clips-ready" : "no-high-confidence-clips";
-  let message = finalClips.length
-    ? `Prepared ${finalClips.length} high-confidence clip draft(s).`
-    : "No high-confidence clip passed the current precision threshold.";
-
-  if (finalClips.length && automation.autoExport) {
+  const job = automationJobs.get(id);
+  if (!job) throw new Error();
+  if (automationRunningJobs.has(job.id) && automationJobPromises.get(job.id) && automationJobPromises.get(job.id) !== runPromise) {
+    resolveOuter(await automationJobPromises.get(job.id));
+    return;
+  }
+  automationRunningJobs.add(job.id);
+  try {
+    const settings = await readServiceSettings();
+    const automation = { ...settings.automation, ...(overrides.automation || {}) };
     Object.assign(job, {
       status: "running",
-      stage: "exporting",
-      message: `Exporting ${finalClips.length} accepted clip(s).`,
+      stage: "analyzing",
+      message: `正在分析 ${automationSourceSummary(automation.sources)} 信号，寻找高置信切片。`,
+      error: "",
+      updatedAt: new Date().toISOString()
+    });
+    await persistAutomationJobs();
+
+    const context = await getVideoContext(job.videoPath);
+    const localCandidates = buildSliceCandidates(context, {
+      sources: automation.sources,
+      clipCount: automation.clipCount,
+      clipDuration: automation.clipDuration,
+      precisionMode: "high"
+    });
+    const candidates = await enhanceSliceCandidatesWithModel(context, automation, localCandidates, settings);
+    const acceptedClips = candidates
+      .filter((candidate) => passesAutomationClipPolicy(candidate, automation))
+      .slice(0, automation.clipCount)
+      .map((candidate) => ({
+        ...candidate,
+        status: "draft",
+        uploadPolicy: job.uploadPolicy,
+        automation: candidate.automation
+      }));
+
+    let finalClips = acceptedClips;
+    let projectPath = await writeAutomationProjectDraft(job.videoPath, finalClips);
+    let uploadDraftPath = null;
+    let uploadPreflight = null;
+    let uploadJobId = null;
+    let exportedClips = [];
+    let stage = finalClips.length ? "clips-ready" : "no-high-confidence-clips";
+    let message = finalClips.length
+      ? `已生成 ${finalClips.length} 个高置信切片草稿。`
+      : "分析完成，但没有片段达到当前高置信阈值。";
+
+    if (finalClips.length && automation.autoExport) {
+      Object.assign(job, {
+        status: "running",
+        stage: "exporting",
+        message: `正在导出 ${finalClips.length} 个切片。`,
+        candidates,
+        acceptedClips: finalClips,
+        projectPath,
+        updatedAt: new Date().toISOString()
+      });
+      await persistAutomationJobs();
+      finalClips = await exportAutomationClips(job.videoPath, finalClips, context, automation);
+      exportedClips = finalClips.filter((clip) => clip.exportPath);
+      projectPath = await writeAutomationProjectDraft(job.videoPath, finalClips);
+      stage = "exported";
+      message = `已导出 ${exportedClips.length} 个切片。`;
+    }
+
+    if (finalClips.some((clip) => clip.exportPath)) {
+      if (!exportedClips.length) exportedClips = finalClips.filter((clip) => clip.exportPath);
+      const uploadResult = await prepareAutomationUpload(job, finalClips, context, automation);
+      uploadDraftPath = uploadResult.uploadDraftPath;
+      uploadPreflight = uploadResult.uploadPreflight;
+      uploadJobId = uploadResult.uploadJobId;
+      if (uploadResult.stage) stage = uploadResult.stage;
+      if (uploadResult.message) message = uploadResult.message;
+    }
+
+    Object.assign(job, {
+      status: "ready",
+      stage,
+      message,
       candidates,
       acceptedClips: finalClips,
+      exportedClips,
+      uploadDraftPath,
+      uploadPreflight,
+      uploadJobId,
       projectPath,
       updatedAt: new Date().toISOString()
     });
     await persistAutomationJobs();
-    finalClips = await exportAutomationClips(job.videoPath, finalClips, context, automation);
-    exportedClips = finalClips.filter((clip) => clip.exportPath);
-    projectPath = await writeAutomationProjectDraft(job.videoPath, finalClips);
-    stage = "exported";
-    message = `Exported ${exportedClips.length} accepted clip(s).`;
+    resolveOuter(job);
+  } finally {
+    automationRunningJobs.delete(id);
   }
-
-  if (finalClips.some((clip) => clip.exportPath)) {
-    if (!exportedClips.length) exportedClips = finalClips.filter((clip) => clip.exportPath);
-    const uploadResult = await prepareAutomationUpload(job, finalClips, context, automation);
-    uploadDraftPath = uploadResult.uploadDraftPath;
-    uploadPreflight = uploadResult.uploadPreflight;
-    uploadJobId = uploadResult.uploadJobId;
-    if (uploadResult.stage) stage = uploadResult.stage;
-    if (uploadResult.message) message = uploadResult.message;
+  } catch (error) {
+    rejectOuter(error);
+  } finally {
+    if (automationJobPromises.get(id) === runPromise) {
+      automationJobPromises.delete(id);
+    }
   }
+  })();
+  return runPromise;
+}
 
-  Object.assign(job, {
-    status: "ready",
-    stage,
-    message,
-    candidates,
-    acceptedClips: finalClips,
-    exportedClips,
-    uploadDraftPath,
-    uploadPreflight,
-    uploadJobId,
-    projectPath,
-    updatedAt: new Date().toISOString()
-  });
-  await persistAutomationJobs();
-  return job;
+function automationSourceSummary(sources = []) {
+  const labels = {
+    danmaku: "弹幕",
+    subtitle: "字幕",
+    visual: "画面",
+    audio: "频谱"
+  };
+  const selected = (Array.isArray(sources) ? sources : [])
+    .map((source) => labels[source])
+    .filter(Boolean);
+  return selected.length ? selected.join("/") : "弹幕";
 }
 
 function passesAutomationClipPolicy(candidate, automation = {}) {
@@ -2258,7 +2677,7 @@ async function prepareAutomationUpload(job, clips, context, automation) {
       uploadPreflight: null,
       uploadJobId: null,
       stage: "upload-draft-ready",
-      message: `Prepared upload draft for ${parts.length} exported clip(s).`
+      message: `已生成 ${parts.length} 个分 P 的投稿草稿。`
     };
   }
 
@@ -2268,7 +2687,7 @@ async function prepareAutomationUpload(job, clips, context, automation) {
       uploadPreflight: null,
       uploadJobId: null,
       stage: "review-ready",
-      message: `Prepared upload draft; ${policyName} policy requires manual review.`
+      message: `已生成投稿草稿；当前策略「${policyName}」需要人工复核。`
     };
   }
 
@@ -2281,12 +2700,12 @@ async function prepareAutomationUpload(job, clips, context, automation) {
       uploadPreflight,
       uploadJobId: null,
       stage: "upload-blocked",
-      message: (policy.issues[0] || uploadPreflight.issues[0] || "Upload preflight blocked automation.")
+      message: (policy.issues[0] || uploadPreflight.issues[0] || "投稿预检未通过，已暂停自动投稿。")
     };
   }
 
   const payload = buildBiliupCommand({ draft });
-  const uploadJob = createUploadJob("automation-biliup-run", policyName === "auto-only-self" ? "Automation private upload" : "Automation public upload");
+  const uploadJob = createUploadJob("automation-biliup-run", policyName === "auto-only-self" ? "自动仅自己可见投稿" : "自动公开投稿");
   uploadJob.policy = policy;
   runProcessJob(uploadJob, payload.executablePath, payload.args, { cwd: process.cwd(), timeoutMs: 1000 * 60 * 60 * 6 });
   return {
@@ -2294,7 +2713,7 @@ async function prepareAutomationUpload(job, clips, context, automation) {
     uploadPreflight,
     uploadJobId: uploadJob.id,
     stage: "upload-started",
-    message: `Started biliup upload job ${uploadJob.id}.`
+    message: `已启动投稿任务 ${uploadJob.id}。`
   };
 }
 
@@ -2864,6 +3283,7 @@ async function startRecordingRoom(roomId, body = {}) {
   const normalizedRoomId = normalizeRoomId(roomId);
   if (!normalizedRoomId) throw new Error("直播间 ID 无效。");
   const room = await findFixedRoom(normalizedRoomId);
+  const oneShot = body.oneShot === true || body.once === true || body.monitor === false;
   if (!room && body.requireConfigured !== false) throw new Error(`房间 ${normalizedRoomId} 不存在。`);
 
   setRoomRuntimeStatus(normalizedRoomId, {
@@ -2875,7 +3295,11 @@ async function startRecordingRoom(roomId, body = {}) {
 
   try {
     const settings = await readServiceSettings();
-    return await startInternalBiliRecorder(settings.recording, room || { roomId: normalizedRoomId, name: `房间 ${normalizedRoomId}` });
+    return await startInternalBiliRecorder(
+      settings.recording,
+      room || { roomId: normalizedRoomId, name: `房间 ${normalizedRoomId}` },
+      { oneShot }
+    );
   } catch (error) {
     return setRoomRuntimeStatus(normalizedRoomId, {
       taskStatus: "error",
@@ -2894,7 +3318,7 @@ async function stopRecordingRoom(roomId) {
   }
   const assets = await scanRecordingAssetsForRoom(normalizedRoomId);
   const current = getRoomRuntimeStatus(normalizedRoomId);
-  mediaCache.clear();
+  // keep media metadata cache across room stops; entries are keyed by mtime/size
   return setRoomRuntimeStatus(normalizedRoomId, {
     ...assets,
     taskStatus: assets.recordingPath ? "completed" : "waiting",
@@ -2906,8 +3330,9 @@ async function stopRecordingRoom(roomId) {
   });
 }
 
-async function startInternalBiliRecorder(recordingSettings, room) {
+async function startInternalBiliRecorder(recordingSettings, room, options = {}) {
   const roomId = normalizeRoomId(room.roomId);
+  const oneShot = options.oneShot === true;
   stopRoomLiveMonitor(roomId);
   if (internalRecorders.has(roomId)) {
     const status = getRoomRuntimeStatus(roomId);
@@ -2922,6 +3347,21 @@ async function startInternalBiliRecorder(recordingSettings, room) {
   }
 
   const roomInfo = await resolveBiliRoomInfo(roomId, recordingSettings);
+  if (oneShot && roomInfo.liveStatus !== 1) {
+    const assets = await scanRecordingAssetsForRoom(roomId);
+    if (room.enabled !== false && recordingSettings.autoMonitorEnabled !== false && recordingMonitorActivated) {
+      startRoomLiveMonitor(room, recordingSettings);
+    }
+    return setRoomRuntimeStatus(roomId, {
+      ...assets,
+      taskStatus: assets.recordingPath ? "completed" : "idle",
+      liveStatus: "offline",
+      message: "当前未开播；本次录制未启动。",
+      nextAction: "start",
+      refreshed: Boolean(assets.recordingPath),
+      log: `One-shot recording skipped because room ${roomId} is offline.\n`
+    });
+  }
   const controller = new AbortController();
   const recorder = {
     roomId,
@@ -2933,6 +3373,8 @@ async function startInternalBiliRecorder(recordingSettings, room) {
     segment: null,
     finalizingSegment: null,
     finalizedSegments: new Set(),
+    pendingReconnectSegments: [],
+    mergingReconnectSegments: false,
     danmaku: null,
     danmakuCount: 0,
     danmakuCurrentPath: null,
@@ -2941,6 +3383,9 @@ async function startInternalBiliRecorder(recordingSettings, room) {
     metrics: createEmptyRecordingMetrics(),
     log: "",
     startedAt: new Date().toISOString(),
+    oneShot,
+    monitorAfterFinish: oneShot && room.enabled !== false && recordingSettings.autoMonitorEnabled !== false,
+    sourceRoom: room,
     done: null
   };
   internalRecorders.set(roomId, recorder);
@@ -2948,6 +3393,7 @@ async function startInternalBiliRecorder(recordingSettings, room) {
   await emitRecordingTimelineEvent("InternalRecorderStartedEvent", recorder, null, { live_status: roomInfo.liveStatus });
   recorder.done = runInternalBiliRecorderLoop(recorder).catch(async (error) => {
     if (!recorder.stopping) {
+      await flushInternalReconnectSegments(recorder, { reason: "error" });
       await emitRecordingTimelineEvent("InternalRecorderErrorEvent", recorder, recorder.segment?.videoPath || null, { error: readableError(error) });
       setRoomRuntimeStatus(roomId, {
         taskStatus: "error",
@@ -2959,6 +3405,9 @@ async function startInternalBiliRecorder(recordingSettings, room) {
     }
   }).finally(() => {
     internalRecorders.delete(roomId);
+    if (recorder.monitorAfterFinish && recordingMonitorActivated) {
+      startRoomLiveMonitor(recorder.sourceRoom, recorder.recordingSettings);
+    }
   });
 
   return setRoomRuntimeStatus(roomId, {
@@ -2999,10 +3448,11 @@ async function stopInternalBiliRecorder(roomId) {
   if (!completed && recorder.segment) {
     await finalizeInternalSegment(recorder, true);
   }
+  await flushInternalReconnectSegments(recorder, { reason: "stop" });
   internalRecorders.delete(normalizedRoomId);
 
   const assets = await scanRecordingAssetsForRoom(normalizedRoomId);
-  mediaCache.clear();
+  // keep media metadata cache across room stops; entries are keyed by mtime/size
   return setRoomRuntimeStatus(normalizedRoomId, {
     ...assets,
     ...buildRecordingMetricStatus(recorder),
@@ -3021,6 +3471,21 @@ async function runInternalBiliRecorderLoop(recorder) {
     if (roomInfo.liveStatus !== 1) {
       closeInternalDanmaku(recorder);
       await emitRecordingTimelineEvent("LiveEndedEvent", recorder, null, { live_status: roomInfo.liveStatus });
+      await flushInternalReconnectSegments(recorder, { reason: "live-ended" });
+      const assets = await scanRecordingAssetsForRoom(recorder.roomId);
+      if (recorder.oneShot) {
+        setRoomRuntimeStatus(recorder.roomId, {
+          ...assets,
+          ...buildRecordingMetricStatus(recorder),
+          taskStatus: assets.recordingPath ? "completed" : "idle",
+          liveStatus: "offline",
+          message: assets.recordingPath ? "本次录制已结束。" : "当前未开播；本次录制未启动。",
+          nextAction: assets.recordingPath ? "open" : "start",
+          refreshed: Boolean(assets.recordingPath),
+          log: `${recorder.log}One-shot recording ended; room is offline.\n`
+        });
+        break;
+      }
       setRoomRuntimeStatus(recorder.roomId, {
         taskStatus: "waiting",
         liveStatus: "offline",
@@ -3037,6 +3502,7 @@ async function runInternalBiliRecorderLoop(recorder) {
     } catch (error) {
       if (recorder.controller.signal.aborted || recorder.stopping) break;
       if (await moveRecorderToOfflineWaitIfLiveEnded(recorder, error)) {
+        if (recorder.oneShot) break;
         await delay(Number(recorder.recordingSettings.pollIntervalSeconds || 600) * 1000, recorder.controller.signal);
         continue;
       }
@@ -3084,18 +3550,19 @@ async function moveRecorderToOfflineWaitIfLiveEnded(recorder, error) {
     return false;
   }
   if (roomInfo.liveStatus === 1) return false;
-  const message = "主播已下播，已收尾并继续等待开播";
+  const message = recorder.oneShot ? "本次录制已结束。" : "主播已下播，已收尾并继续等待开播";
   closeInternalDanmaku(recorder);
   recorder.log += `${message}：${readableError(error)}\n`;
   await emitRecordingTimelineEvent("LiveEndedEvent", recorder, null, { live_status: roomInfo.liveStatus });
+  await flushInternalReconnectSegments(recorder, { reason: "live-ended" });
   const assets = await scanRecordingAssetsForRoom(recorder.roomId);
   setRoomRuntimeStatus(recorder.roomId, {
     ...assets,
     ...buildRecordingMetricStatus(recorder),
-    taskStatus: "waiting",
+    taskStatus: recorder.oneShot ? (assets.recordingPath ? "completed" : "idle") : "waiting",
     liveStatus: "offline",
     message,
-    nextAction: "stop",
+    nextAction: recorder.oneShot ? (assets.recordingPath ? "open" : "start") : "stop",
     refreshed: Boolean(assets.recordingPath),
     log: recorder.log
   });
@@ -3330,6 +3797,10 @@ async function finalizeInternalSegment(recorder, completed) {
   if (recorder.stopping || recorder.controller?.signal?.aborted) {
     closeInternalDanmaku(recorder);
   }
+  await drainDanmakuWrites(segment.danmakuPath);
+  if (recorder.recordingSettings.saveRawDanmaku && segment.rawDanmakuPath) {
+    await drainDanmakuWrites(segment.rawDanmakuPath);
+  }
   await ensureDanmakuXmlClosed(segment.danmakuPath);
   const videoStat = safeStat(segment.videoPath);
   const hasVideo = Boolean(videoStat && videoStat.size > 0);
@@ -3337,34 +3808,233 @@ async function finalizeInternalSegment(recorder, completed) {
   if (recorder.recordingSettings.saveRawDanmaku && segment.rawDanmakuPath) {
     await emitRecordingTimelineEvent("RawDanmakuFileCompletedEvent", recorder, segment.rawDanmakuPath, { danmaku_count: recorder.danmakuCount });
   }
+  let finalVideoPath = segment.videoPath;
+  let archivedShortRecording = false;
   if (hasVideo) {
-    await emitRecordingTimelineEvent("VideoFileCompletedEvent", recorder, segment.videoPath, { completed });
-    const postprocess = await postprocessInternalRecordingSegment(recorder, segment);
+    await emitRecordingTimelineEvent("VideoFileCompletedEvent", recorder, segment.videoPath, { completed, postprocess_pending: true });
+    const deferCompletion = shouldDeferInternalSegmentCompletion(recorder, segment, completed);
+    const postprocess = await postprocessInternalRecordingSegment(recorder, { ...segment, skipShortArchive: deferCompletion });
+    finalVideoPath = postprocess.videoPath || finalVideoPath;
+    archivedShortRecording = Boolean(postprocess.archivedShortRecording);
     if (postprocess.coverPath) {
       await emitRecordingTimelineEvent("CoverImageDownloadedEvent", recorder, postprocess.coverPath, { source_path: segment.videoPath });
     }
-    if (postprocess.videoPath && postprocess.videoPath !== segment.videoPath) {
-      await emitRecordingTimelineEvent("VideoPostprocessingCompletedEvent", recorder, postprocess.videoPath, {
-        source_path: segment.videoPath,
-        deleted_source: postprocess.deletedSource
-      });
+    if (deferCompletion) {
+      const deferred = await deferInternalReconnectSegmentCompletion(recorder, segment, postprocess, completed);
+      if (!deferred) {
+        await emitInternalSegmentPostprocessEvent(recorder, segment, postprocess);
+      }
+    } else {
+      await emitInternalSegmentPostprocessEvent(recorder, segment, postprocess);
     }
   }
   const assets = await scanRecordingAssetsForRoom(recorder.roomId);
   if (recorder.stopping) {
-    await emitRecordingTimelineEvent("RecordingFinishedEvent", recorder, assets.recordingPath || segment.videoPath);
+    await emitRecordingTimelineEvent("RecordingFinishedEvent", recorder, assets.recordingPath || finalVideoPath);
   }
   setRoomRuntimeStatus(recorder.roomId, {
     ...assets,
     ...buildRecordingMetricStatus(recorder),
     taskStatus: recorder.stopping ? (hasVideo ? "completed" : "error") : "waiting",
     liveStatus: recorder.stopping ? "offline" : "live",
-    message: recorder.stopping ? (hasVideo ? "已完成" : "停止后没有找到已完成的视频文件。") : "分段完成，等待下一段",
-    nextAction: recorder.stopping ? (hasVideo ? "open" : "retry") : "stop",
+    message: recorder.stopping ? (archivedShortRecording ? "短录制已归档" : hasVideo ? "已完成" : "停止后没有找到已完成的视频文件。") : "分段完成，等待下一段",
+    nextAction: recorder.stopping ? (archivedShortRecording ? "start" : hasVideo ? "open" : "retry") : "stop",
     refreshed: hasVideo,
     log: recorder.log
   });
   recorder.segment = null;
+}
+
+function shouldMergeInternalReconnectSegments(settings = {}) {
+  if (settings.mergeReconnectSegments === false) return false;
+  return Number(settings.reconnectMergeWindowSeconds || 0) > 0;
+}
+
+function shouldDeferInternalSegmentCompletion(recorder, segment, completed) {
+  if (!shouldMergeInternalReconnectSegments(recorder.recordingSettings)) return false;
+  if (!segment?.videoPath) return false;
+  if (recorder.segmentRolling) return false;
+  return Boolean(completed || recorder.stopping || recorder.controller?.signal?.aborted);
+}
+
+async function deferInternalReconnectSegmentCompletion(recorder, segment, postprocess, completed) {
+  if (!postprocess?.videoPath || postprocess.archivedShortRecording) return false;
+  const windowSeconds = Math.max(0, Number(recorder.recordingSettings?.reconnectMergeWindowSeconds || 0));
+  const entry = {
+    segment: { ...segment },
+    postprocess: { ...postprocess },
+    videoPath: postprocess.videoPath,
+    startedAtMs: Number(segment.startedAtMs || Date.now()),
+    endedAtMs: Date.now(),
+    completed: Boolean(completed)
+  };
+  const pending = Array.isArray(recorder.pendingReconnectSegments) ? recorder.pendingReconnectSegments : [];
+  const previous = pending[pending.length - 1];
+  if (previous && windowSeconds > 0) {
+    const gapSeconds = Math.max(0, (entry.startedAtMs - Number(previous.endedAtMs || previous.startedAtMs || 0)) / 1000);
+    if (gapSeconds > windowSeconds) {
+      await flushInternalReconnectSegments(recorder, { reason: "window-expired" });
+    }
+  }
+  if (!Array.isArray(recorder.pendingReconnectSegments)) recorder.pendingReconnectSegments = [];
+  recorder.pendingReconnectSegments.push(entry);
+  recorder.log += `Queued reconnect segment for merge: ${postprocess.videoPath}\n`;
+  return true;
+}
+
+async function flushInternalReconnectSegments(recorder, { reason = "flush" } = {}) {
+  if (!recorder || recorder.mergingReconnectSegments) return null;
+  const pending = Array.isArray(recorder.pendingReconnectSegments) ? recorder.pendingReconnectSegments : [];
+  if (!pending.length) return null;
+  recorder.pendingReconnectSegments = [];
+  recorder.mergingReconnectSegments = true;
+  try {
+    if (pending.length === 1) {
+      return await emitDeferredInternalSegment(recorder, pending[0]);
+    }
+    try {
+      const merged = await mergeInternalReconnectSegments(recorder, pending, reason);
+      await archiveMergedReconnectSegmentSources(recorder, pending, merged.videoPath);
+      await emitMergedInternalSegment(recorder, pending, merged);
+      return merged.videoPath;
+    } catch (error) {
+      recorder.log += `Reconnect segment merge failed; keeping original segments: ${readableError(error)}\n`;
+      for (const entry of pending) {
+        await emitDeferredInternalSegment(recorder, entry);
+      }
+      return null;
+    }
+  } finally {
+    recorder.mergingReconnectSegments = false;
+  }
+}
+
+async function emitDeferredInternalSegment(recorder, entry) {
+  const result = { ...entry.postprocess };
+  await maybeArchiveShortRecording(recorder, entry.segment, result);
+  await emitInternalSegmentPostprocessEvent(recorder, entry.segment, result);
+  return result.videoPath;
+}
+
+async function emitInternalSegmentPostprocessEvent(recorder, segment, postprocess) {
+  if (postprocess.archivedShortRecording) {
+    await emitRecordingTimelineEvent("ShortRecordingArchivedEvent", recorder, postprocess.videoPath, {
+      source_path: segment.videoPath,
+      duration_seconds: postprocess.durationSeconds,
+      threshold_seconds: postprocess.thresholdSeconds,
+      archived_files: postprocess.archivedFiles
+    });
+  } else if (postprocess.videoPath) {
+    await emitRecordingTimelineEvent("VideoPostprocessingCompletedEvent", recorder, postprocess.videoPath, {
+      source_path: segment.videoPath,
+      deleted_source: postprocess.deletedSource
+    });
+  }
+}
+
+async function mergeInternalReconnectSegments(recorder, entries, reason) {
+  const first = entries[0];
+  const outputPath = nextAvailablePath(buildMergedReconnectSegmentPath(first.videoPath));
+  const listPath = nextAvailablePath(outputPath.replace(/\.mp4$/i, ".concat.txt"));
+  const listBody = entries
+    .map((entry) => `file '${escapeFfconcatPath(path.resolve(entry.videoPath))}'`)
+    .join("\n");
+  await fsp.writeFile(listPath, `${listBody}\n`, "utf8");
+  try {
+    await execFfmpeg([
+      "-y",
+      "-f",
+      "concat",
+      "-safe",
+      "0",
+      "-i",
+      listPath,
+      "-map",
+      "0",
+      "-c",
+      "copy",
+      "-movflags",
+      "+faststart",
+      outputPath
+    ], {
+      timeout: 1000 * 60 * 60,
+      maxBuffer: 1024 * 1024 * 8
+    });
+  } finally {
+    await fsp.rm(listPath, { force: true }).catch(() => null);
+  }
+  if (!(await isValidPostprocessVideo(outputPath))) {
+    throw new Error("Merged reconnect video failed validation.");
+  }
+  recorder.log += `Merged ${entries.length} reconnect segments (${reason}) -> ${outputPath}\n`;
+  return { videoPath: outputPath, sourceCount: entries.length };
+}
+
+function buildMergedReconnectSegmentPath(videoPath) {
+  const parsed = path.parse(videoPath);
+  return path.join(parsed.dir, `${parsed.name}.merged.mp4`);
+}
+
+function escapeFfconcatPath(filePath) {
+  return String(filePath).replace(/\\/g, "/").replace(/'/g, "'\\''");
+}
+
+async function emitMergedInternalSegment(recorder, entries, merged) {
+  const first = entries[0];
+  const result = {
+    videoPath: merged.videoPath,
+    coverPath: null,
+    deletedSource: false,
+    archivedShortRecording: false,
+    archivedFiles: [],
+    durationSeconds: 0,
+    thresholdSeconds: 0
+  };
+  await maybeArchiveShortRecording(recorder, { ...first.segment, videoPath: merged.videoPath }, result);
+  if (result.archivedShortRecording) {
+    await emitRecordingTimelineEvent("ShortRecordingArchivedEvent", recorder, result.videoPath, {
+      source_path: merged.videoPath,
+      duration_seconds: result.durationSeconds,
+      threshold_seconds: result.thresholdSeconds,
+      archived_files: result.archivedFiles,
+      merged_segments: entries.length,
+      source_paths: entries.map((entry) => entry.videoPath)
+    });
+    return;
+  }
+  await emitRecordingTimelineEvent("VideoPostprocessingCompletedEvent", recorder, result.videoPath, {
+    source_path: first.segment.videoPath,
+    deleted_source: false,
+    merged_segments: entries.length,
+    source_paths: entries.map((entry) => entry.videoPath)
+  });
+}
+
+async function archiveMergedReconnectSegmentSources(recorder, entries, mergedPath) {
+  const archiveRoot = path.resolve(recorder.recordingSettings?.mergedSegmentArchiveDir || mergedSegmentsDir);
+  const roomDirName = path.basename(path.dirname(mergedPath || entries[0]?.videoPath || ""));
+  const archiveDir = path.join(archiveRoot, sanitizeFileSegment(roomDirName || recorder.roomId || "room"));
+  const archiveMap = new Map();
+  const addArchiveCandidate = (filePath) => {
+    if (!filePath || !safeStat(filePath)?.isFile?.()) return;
+    if (mergedPath && path.resolve(filePath) === path.resolve(mergedPath)) return;
+    const resolved = path.resolve(filePath);
+    if (archiveMap.has(resolved)) return;
+    archiveMap.set(resolved, path.join(archiveDir, path.basename(filePath)));
+  };
+  for (const entry of entries) {
+    addArchiveCandidate(entry.videoPath);
+    addArchiveCandidate(entry.segment?.videoPath);
+    addArchiveCandidate(entry.segment?.danmakuPath);
+    addArchiveCandidate(entry.segment?.rawDanmakuPath);
+    addArchiveCandidate(entry.postprocess?.coverPath);
+    addArchiveCandidate(entry.segment?.coverPath);
+  }
+  let moved = 0;
+  for (const [source, target] of archiveMap.entries()) {
+    if (await moveFileToUniqueArchivePath(source, target)) moved += 1;
+  }
+  if (moved) recorder.log += `Archived ${moved} merged reconnect source files -> ${archiveDir}\n`;
 }
 
 async function ensureDanmakuXmlClosed(filePath) {
@@ -3393,7 +4063,11 @@ async function postprocessInternalRecordingSegment(recorder, segment) {
   const result = {
     videoPath: segment.videoPath,
     coverPath: null,
-    deletedSource: false
+    deletedSource: false,
+    archivedShortRecording: false,
+    archivedFiles: [],
+    durationSeconds: 0,
+    thresholdSeconds: 0
   };
 
   if (settings.saveCover) {
@@ -3425,7 +4099,79 @@ async function postprocessInternalRecordingSegment(recorder, segment) {
     }
   }
 
+  if (!segment.skipShortArchive) {
+    await maybeArchiveShortRecording(recorder, segment, result);
+  }
   return result;
+}
+
+async function maybeArchiveShortRecording(recorder, segment, result) {
+  const settings = recorder.recordingSettings || {};
+  if (!settings.shortRecordingCleanupEnabled) return result;
+  const thresholdSeconds = Math.max(0, Number(settings.shortRecordingMinSeconds || 0));
+  if (!thresholdSeconds || !result.videoPath || !safeStat(result.videoPath)?.size) return result;
+  const probe = await probePostprocessVideo(result.videoPath);
+  const durationSeconds = Number(probe.duration || 0);
+  result.durationSeconds = durationSeconds;
+  result.thresholdSeconds = thresholdSeconds;
+  if (!probe.valid || durationSeconds <= 0 || durationSeconds >= thresholdSeconds) return result;
+
+  const archiveRoot = path.resolve(settings.shortRecordingArchiveDir || shortRecordingsDir);
+  const roomDirName = path.basename(path.dirname(segment.videoPath || result.videoPath));
+  const archiveDir = path.join(archiveRoot, sanitizeFileSegment(roomDirName || recorder.roomId || "room"));
+  const archiveMap = new Map();
+  const addArchiveCandidate = (filePath) => {
+    if (!filePath || !safeStat(filePath)?.isFile?.()) return;
+    const resolved = path.resolve(filePath);
+    if (archiveMap.has(resolved)) return;
+    archiveMap.set(resolved, path.join(archiveDir, path.basename(filePath)));
+  };
+  addArchiveCandidate(result.videoPath);
+  addArchiveCandidate(segment.videoPath);
+  addArchiveCandidate(segment.danmakuPath);
+  addArchiveCandidate(segment.rawDanmakuPath);
+  addArchiveCandidate(result.coverPath);
+  addArchiveCandidate(segment.coverPath);
+
+  const moved = [];
+  for (const [source, target] of archiveMap.entries()) {
+    const archivedPath = await moveFileToUniqueArchivePath(source, target);
+    if (archivedPath) moved.push({ source, archivedPath });
+  }
+  const main = moved.find((item) => path.resolve(item.source) === path.resolve(result.videoPath));
+  if (main) result.videoPath = main.archivedPath;
+  const cover = moved.find((item) => result.coverPath && path.resolve(item.source) === path.resolve(result.coverPath));
+  if (cover) result.coverPath = cover.archivedPath;
+  result.archivedShortRecording = moved.length > 0;
+  result.archivedFiles = moved.map((item) => item.archivedPath);
+  if (result.archivedShortRecording) {
+    recorder.log += `短录制 ${Math.round(durationSeconds)}s 小于 ${thresholdSeconds}s，已归档到 ${archiveDir}\n`;
+  }
+  return result;
+}
+
+async function moveFileToUniqueArchivePath(sourcePath, targetPath) {
+  if (!sourcePath || !safeStat(sourcePath)?.isFile?.()) return null;
+  const target = nextAvailablePath(targetPath);
+  await fsp.mkdir(path.dirname(target), { recursive: true });
+  try {
+    await fsp.rename(sourcePath, target);
+  } catch (error) {
+    if (error?.code !== "EXDEV") throw error;
+    await fsp.copyFile(sourcePath, target);
+    await fsp.rm(sourcePath, { force: true });
+  }
+  return target;
+}
+
+function nextAvailablePath(targetPath) {
+  if (!fs.existsSync(targetPath)) return targetPath;
+  const parsed = path.parse(targetPath);
+  for (let index = 1; index < 1000; index += 1) {
+    const candidate = path.join(parsed.dir, `${parsed.name}-${index}${parsed.ext}`);
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+  return path.join(parsed.dir, `${parsed.name}-${Date.now()}${parsed.ext}`);
 }
 
 async function saveInternalRecordingCover(recorder, videoPath, coverPath) {
@@ -3479,7 +4225,11 @@ function execFfprobe(args, options = {}) {
 }
 
 async function isValidPostprocessVideo(videoPath) {
-  if (!safeStat(videoPath)?.size) return false;
+  return (await probePostprocessVideo(videoPath)).valid;
+}
+
+async function probePostprocessVideo(videoPath) {
+  if (!safeStat(videoPath)?.size) return { valid: false, duration: 0, format: null };
   try {
     const { stdout } = await execFfprobe([
       "-v",
@@ -3494,9 +4244,14 @@ async function isValidPostprocessVideo(videoPath) {
       maxBuffer: 1024 * 1024
     });
     const parsed = JSON.parse(stdout || "{}");
-    return Boolean(parsed?.format);
+    const duration = Number(parsed?.format?.duration || 0);
+    return {
+      valid: Boolean(parsed?.format),
+      duration: Number.isFinite(duration) ? duration : 0,
+      format: parsed?.format || null
+    };
   } catch {
-    return false;
+    return { valid: false, duration: 0, format: null };
   }
 }
 
@@ -4271,6 +5026,31 @@ function normalizeInternalDanmakuEvent(message, recordingSettings = {}) {
   return null;
 }
 
+function enqueueDanmakuWrite(filePath, writeFn) {
+  const key = path.resolve(String(filePath || ""));
+  if (!key) return Promise.resolve();
+  const previous = danmakuWriteQueues.get(key) || Promise.resolve();
+  const next = previous
+    .catch(() => {})
+    .then(writeFn)
+    .finally(() => {
+      if (danmakuWriteQueues.get(key) === next) {
+        danmakuWriteQueues.delete(key);
+      }
+    });
+  danmakuWriteQueues.set(key, next);
+  return next;
+}
+
+async function drainDanmakuWrites(filePath) {
+  if (!filePath) return;
+  const key = path.resolve(filePath);
+  const pending = danmakuWriteQueues.get(key);
+  if (pending) {
+    await pending.catch(() => {});
+  }
+}
+
 function appendInternalDanmaku(recorder, text, rawMessage = null, event = {}) {
   const clean = String(text || "").trim();
   const danmakuPath = recorder.danmakuCurrentPath || recorder.segment?.danmakuPath;
@@ -4284,21 +5064,21 @@ function appendInternalDanmaku(recorder, text, rawMessage = null, event = {}) {
   const fontSize = Math.max(12, Number(event.fontSize || 25));
   const color = Math.max(0, Number(event.color || 16777215));
   const line = `<d p="${time},${mode},${fontSize},${color},${unix},0,0,${sequence}">${escapeXml(clean)}</d>\n`;
-  fsp.appendFile(danmakuPath, line, "utf8")
-    .then(() => {
-      recorder.danmakuCount = Math.max(Number(recorder.danmakuCount || 0), sequence);
-    })
-    .catch((error) => {
-      recorder.log += `弹幕写入失败：${readableError(error)}\n`;
-    });
+  void enqueueDanmakuWrite(danmakuPath, async () => {
+    await fsp.appendFile(danmakuPath, line, "utf8");
+    recorder.danmakuCount = Math.max(Number(recorder.danmakuCount || 0), sequence);
+  }).catch((error) => {
+    recorder.log += `弹幕写入失败：${readableError(error)}\n`;
+  });
   if (recorder.recordingSettings.saveRawDanmaku && recorder.segment?.rawDanmakuPath && recorder.danmakuCurrentPath === recorder.segment.danmakuPath) {
     const rawPayload = rawMessage && typeof rawMessage === "object"
       ? { ...rawMessage, internal_event: { ...event, text: clean, time: Number(time) } }
       : { text: clean, time: Number(time), internal_event: event };
-    fsp.appendFile(recorder.segment.rawDanmakuPath, `${JSON.stringify(rawPayload)}\n`, "utf8")
-      .catch((error) => {
-        recorder.log += `原始弹幕写入失败：${readableError(error)}\n`;
-      });
+    void enqueueDanmakuWrite(recorder.segment.rawDanmakuPath, async () => {
+      await fsp.appendFile(recorder.segment.rawDanmakuPath, `${JSON.stringify(rawPayload)}\n`, "utf8");
+    }).catch((error) => {
+      recorder.log += `原始弹幕写入失败：${readableError(error)}\n`;
+    });
   }
 }
 
@@ -4512,7 +5292,7 @@ function buildBiliupCommand(body) {
     throw new Error("未检测到 biliup。请先安装本地 biliup。");
   }
   const draft = body?.draft || body || {};
-  const parts = normalizeUploadParts(draft.parts || body?.parts || []);
+  const parts = normalizeUploadParts(draft.parts || body?.parts || [], { requireAllowed: true });
   const publishMode = draft.publishMode === "append" ? "append" : "upload";
   if (!parts.length) {
     throw new Error("分 P 队列为空，至少需要一个本地视频路径。");
@@ -4521,7 +5301,9 @@ function buildBiliupCommand(body) {
     throw new Error("追加分 P 需要填写目标稿件 BV 或 av 号。");
   }
 
-  const args = ["-u", draft.cookiePath || path.join(draftsDir, "cookies.json"), publishMode];
+  const invocation = getBiliupInvocation(tools);
+  const cookie = resolveUploadCookiePath(draft.cookiePath || "");
+  const args = ["-u", cookie.path, publishMode];
   if (publishMode === "append") {
     args.push("--vid", String(draft.vid).trim());
   }
@@ -4553,9 +5335,10 @@ function buildBiliupCommand(body) {
     ok: true,
     mode: publishMode,
     parts,
-    executablePath: tools.biliupPath,
-    args,
-    command: [tools.biliupPath, ...args].map(quoteArg).join(" "),
+    executablePath: invocation.executablePath,
+    args: [...invocation.argsPrefix, ...args],
+    cookiePath: cookie.path,
+    command: [invocation.executablePath, ...invocation.argsPrefix, ...args].map(quoteArg).join(" "),
     notes: [
       publishMode === "append" ? "会调用 biliup append，把队列中的视频追加到目标稿件。" : "会调用 biliup upload，队列中的多个文件会作为多 P 投稿。",
       draft.visibility === "onlySelf" || draft.isOnlySelf ? "已带 --is-only-self 1，对应仅自己可见。" : "当前是公开可见。"
@@ -4573,11 +5356,17 @@ function preflightUpload(draft) {
   if (!tools.biliupPath) {
     issues.push("未检测到 biliup。请先安装本地 biliup。");
   }
-  const cookiePath = String(draft.cookiePath || tools.cookiePath);
-  if (!fs.existsSync(cookiePath)) {
+  const cookie = resolveUploadCookiePath(draft.cookiePath || "");
+  const cookiePath = cookie.path;
+  if (!cookie.exists) {
     issues.push(`未找到 cookie 文件：${cookiePath}`);
   }
-  const parts = normalizeUploadParts(draft.parts || []);
+  let parts = [];
+  try {
+    parts = normalizeUploadParts(draft.parts || [], { requireAllowed: true });
+  } catch (error) {
+    issues.push(readableError(error));
+  }
   if (!parts.length) {
     issues.push("分 P 队列为空。");
   }
@@ -4592,17 +5381,24 @@ function preflightUpload(draft) {
   const cover = normalizeLocalCliPath(draft.cover);
   if (draft.cover && !cover) {
     warnings.push("封面是 URL 或接口地址，biliup CLI 会忽略它；请先抽取本地封面帧。");
-  } else if (cover && !safeStat(cover)) {
-    issues.push(`封面文件不存在：${cover}`);
+  } else if (cover) {
+    try {
+      assertAllowedFile(path.resolve(cover));
+      if (!safeStat(cover)) {
+        issues.push(`封面文件不存在：${cover}`);
+      }
+    } catch (error) {
+      issues.push(`封面路径不允许：${readableError(error)}`);
+    }
   }
   if (draft.publishMode === "append" && !String(draft.vid || "").trim()) {
     issues.push("追加分 P 需要目标 BV 或 av 号。");
   }
 
   let command = "";
-  if (tools.biliupPath && parts.length) {
+  if (tools.biliupPath && parts.length && issues.length === 0) {
     try {
-      command = buildBiliupCommand({ draft: { ...policy.effectiveDraft, cookiePath } }).command;
+      command = buildBiliupCommand({ draft: { ...policy.effectiveDraft, cookiePath, parts } }).command;
     } catch (error) {
       warnings.push(readableError(error));
     }
@@ -4614,18 +5410,29 @@ function preflightUpload(draft) {
     warnings,
     policy,
     command,
+    cookie,
     tools
   };
 }
 
-function normalizeUploadParts(parts) {
+function normalizeUploadParts(parts, options = {}) {
+  const requireAllowed = options.requireAllowed !== false;
   return (Array.isArray(parts) ? parts : [])
-    .map((part, index) => ({
-      id: String(part?.id || `part-${index + 1}`),
-      title: String(part?.title || `P${index + 1}`),
-      path: String(part?.path || "").trim()
-    }))
-    .filter((part) => part.path);
+    .map((part, index) => {
+      const rawPath = String(part?.path || "").trim();
+      if (!rawPath) return null;
+      const resolved = path.resolve(rawPath);
+      if (requireAllowed) {
+        assertAllowedFile(resolved);
+      }
+      return {
+        id: String(part?.id || `part-${index + 1}`),
+        title: String(part?.title || `P${index + 1}`),
+        path: resolved,
+        source: part?.source
+      };
+    })
+    .filter(Boolean);
 }
 
 function normalizeLocalCliPath(value) {
@@ -4660,22 +5467,40 @@ function formatProcessError(error) {
 
 async function runBiliupReadCommand(kind, body) {
   const tools = getUploadTools();
-  if (!tools.biliupPath) {
-    return {
-      ok: false,
-      message: "当前系统 PATH 没有 biliup，不能读取历史稿件或已有分 P。",
-      command: kind === "list" ? "biliup -u .workbench/drafts/cookies.json list --max-pages 1" : `biliup -u .workbench/drafts/cookies.json show ${body.vid || "<BV/av>"}`
-    };
-  }
-  const cookiePath = String(body?.cookiePath || tools.cookiePath);
-  if (!fs.existsSync(cookiePath)) {
+  const defaultCommand = kind === "list"
+    ? `biliup -u ${quoteArg(tools.cookiePath)} list --max-pages 1`
+    : `biliup -u ${quoteArg(tools.cookiePath)} show ${body?.vid || "<BV/av>"}`;
+  const cookie = resolveUploadCookiePath(body?.cookiePath || "");
+  const cookiePath = cookie.path;
+  if (!cookie.exists) {
     return {
       ok: false,
       message: `未找到 cookie 文件：${cookiePath}。需要先扫码登录。`,
-      command: `biliup -u ${quoteArg(cookiePath)} login`
+      command: `biliup -u ${quoteArg(cookiePath)} login`,
+      needsLogin: true,
+      cookie,
+      tools: { ...tools, cookiePath, cookieExists: false, cookieSource: cookie.source, cookieCandidates: cookie.candidates }
     };
   }
 
+  let memberReadError = null;
+  try {
+    return await runBiliMemberReadCommand(kind, body, cookie, tools);
+  } catch (memberError) {
+    memberReadError = memberError;
+    if (!tools.biliupPath) {
+      return {
+        ok: false,
+        message: `B 站网页接口读取失败，且当前系统 PATH 没有 biliup 可回退：${readableError(memberError)}`,
+        command: defaultCommand,
+        output: readableError(memberError),
+        cookie,
+        tools: { ...tools, cookiePath, cookieExists: true, cookieSource: cookie.source, cookieCandidates: cookie.candidates }
+      };
+    }
+  }
+
+  const invocation = getBiliupInvocation(tools);
   const args = ["-u", cookiePath];
   if (kind === "list") {
     args.push("list", "--max-pages", String(Math.min(5, Math.max(1, Number(body?.maxPages || 1)))));
@@ -4683,9 +5508,9 @@ async function runBiliupReadCommand(kind, body) {
     args.push("show", String(body.vid));
   }
 
-  const command = [tools.biliupPath, ...args].map(quoteArg).join(" ");
+  const command = [invocation.executablePath, ...invocation.argsPrefix, ...args].map(quoteArg).join(" ");
   try {
-    const result = await execFileAsync(tools.biliupPath, args, {
+    const result = await execFileAsync(invocation.executablePath, [...invocation.argsPrefix, ...args], {
       cwd: workbenchRoot,
       timeout: 60000,
       maxBuffer: 1024 * 1024 * 8,
@@ -4696,16 +5521,256 @@ async function runBiliupReadCommand(kind, body) {
       ok: true,
       command,
       output,
+      cookie,
+      tools: { ...tools, cookiePath, cookieExists: true, cookieSource: cookie.source, cookieCandidates: cookie.candidates },
       ...(kind === "list" ? { archives: parseBiliupList(output) } : parseBiliupShow(output))
     };
   } catch (error) {
+    const output = formatProcessError(error);
+    const memberMessage = memberReadError ? `B 站网页接口也读取失败：${readableError(memberReadError)}` : "";
     return {
       ok: false,
       command,
-      message: "biliup 读取失败，请检查 cookie 是否有效或账号是否有权限。",
-      output: formatProcessError(error)
+      message: memberMessage
+        ? `${memberMessage}；biliup 回退也失败。`
+        : "Cookie 文件存在，但 biliup 读取稿件失败；可能是 Cookie 过期、账号权限不足，或 biliup 输出格式变化。",
+      output: [memberMessage, output].filter(Boolean).join("\n\n"),
+      exitCode: error?.code ?? null,
+      memberApiError: memberReadError ? readableError(memberReadError) : "",
+      cookie,
+      tools: { ...tools, cookiePath, cookieExists: true, cookieSource: cookie.source, cookieCandidates: cookie.candidates }
     };
   }
+}
+
+async function runBiliMemberReadCommand(kind, body, cookie, tools) {
+  if (kind === "list") {
+    const maxPages = Math.min(5, Math.max(1, Number(body?.maxPages || 1)));
+    const archives = [];
+    for (let page = 1; page <= maxPages; page += 1) {
+      const data = await fetchBiliMemberJson(cookie.path, "/x/web/archives", {
+        status: "is_pubing,pubed,not_pubed",
+        pn: page,
+        ps: 20,
+        coop: 1,
+        interactive: 1
+      });
+      const items = asArray(data.arc_audits || data.archives || data.list);
+      archives.push(...items.map(parseBiliMemberArchiveItem).filter((item) => item.bvid));
+      const pageInfo = data.page || {};
+      const total = Number(pageInfo.count || pageInfo.total || 0);
+      const size = Number(pageInfo.ps || pageInfo.size || 20);
+      if (!items.length || (total > 0 && page * size >= total)) break;
+    }
+    return {
+      ok: true,
+      command: "B 站网页接口：/x/web/archives",
+      source: "member-api",
+      cookie,
+      tools: { ...tools, cookiePath: cookie.path, cookieExists: true, cookieSource: cookie.source, cookieCandidates: cookie.candidates },
+      archives
+    };
+  }
+
+  const vid = String(body?.vid || "").trim();
+  if (!vid) throw new Error("需要 BV 或 av 号。");
+  const params = /^av\d+$/i.test(vid)
+    ? { aid: vid.replace(/^av/i, "") }
+    : /^\d+$/.test(vid)
+      ? { aid: vid }
+      : { bvid: vid };
+  let parsed;
+  try {
+    const data = await fetchBiliMemberJson(cookie.path, "/x/vupre/web/archive/view", params);
+    parsed = parseBiliMemberArchiveDetail(data);
+  } catch (memberError) {
+    try {
+      parsed = await fetchBiliWebArchiveDetail(cookie.path, params);
+    } catch (webError) {
+      throw new Error(`创作中心接口失败：${readableError(memberError)}；公开视频详情接口也失败：${readableError(webError)}`);
+    }
+  }
+  return {
+    ok: true,
+    command: parsed.source === "web-interface" ? "B 站网页接口：/x/web-interface/view" : "B 站网页接口：/x/vupre/web/archive/view",
+    source: parsed.source || "member-api",
+    cookie,
+    tools: { ...tools, cookiePath: cookie.path, cookieExists: true, cookieSource: cookie.source, cookieCandidates: cookie.candidates },
+    ...parsed
+  };
+}
+
+async function fetchBiliWebArchiveDetail(cookiePath, params = {}) {
+  const url = new URL("/x/web-interface/view", getBiliWebApiBase({}));
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(url, {
+      headers: {
+        ...getBiliHeaders("", { cookiePath }),
+        "Origin": "https://www.bilibili.com",
+        "Referer": params.bvid ? `https://www.bilibili.com/video/${params.bvid}/` : "https://www.bilibili.com/"
+      },
+      signal: controller.signal
+    });
+    const json = await response.json();
+    if (!response.ok) throw new Error(`B 站公开视频详情接口失败：HTTP ${response.status}`);
+    if (json?.code && json.code !== 0) throw new Error(json.message || json.msg || `B 站公开视频详情接口 code ${json.code}`);
+    return parseBiliWebArchiveDetail(json.data || {});
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchBiliMemberJson(cookiePath, apiPath, params = {}) {
+  const url = new URL(apiPath, getBiliMemberApiBase());
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(url, {
+      headers: getBiliMemberHeaders(cookiePath),
+      signal: controller.signal
+    });
+    const text = await response.text();
+    let json = {};
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new Error(`B 站网页接口返回非 JSON：HTTP ${response.status}`);
+    }
+    if (!response.ok) throw new Error(`B 站网页接口失败：HTTP ${response.status}`);
+    if (json?.code && json.code !== 0) throw new Error(json.message || json.msg || `B 站网页接口 code ${json.code}`);
+    return json.data || {};
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function getBiliMemberApiBase() {
+  const configured = String(process.env.BILI_MEMBER_API_BASE || "https://member.bilibili.com").trim();
+  return configured.endsWith("/") ? configured : `${configured}/`;
+}
+
+function getBiliMemberHeaders(cookiePath) {
+  const cookie = readBiliCookieHeader({ cookiePath });
+  return {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5",
+    "Cache-Control": "no-cache",
+    ...(cookie ? { "Cookie": cookie } : {}),
+    "Origin": "https://member.bilibili.com",
+    "Pragma": "no-cache",
+    "Referer": "https://member.bilibili.com/platform/upload-manager/article",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36"
+  };
+}
+
+function parseBiliMemberArchiveItem(item = {}) {
+  const archive = item.Archive || item.archive || item;
+  return {
+    bvid: String(archive.bvid || archive.Bvid || item.bvid || ""),
+    aid: archive.aid || archive.Aid || item.aid || null,
+    title: String(archive.title || archive.Title || item.title || ""),
+    status: biliArchiveStateLabel(archive, item),
+    partCount: asArray(item.Videos || item.videos).length
+  };
+}
+
+function parseBiliMemberArchiveDetail(data = {}) {
+  const archive = data.archive || data.Archive || {};
+  const videos = asArray(data.videos || data.Videos);
+  return {
+    source: "member-api",
+    archive: {
+      bvid: String(archive.bvid || archive.Bvid || ""),
+      aid: archive.aid || archive.Aid || null,
+      title: String(archive.title || archive.Title || ""),
+      cover: String(archive.cover || archive.Cover || ""),
+      tag: String(archive.tag || archive.Tag || ""),
+      tid: archive.tid || archive.Tid || null,
+      duration: Number(archive.duration || 0),
+      isOnlySelf: Number(archive.is_only_self ?? archive.isOnlySelf ?? 0),
+      state: archive.state ?? null,
+      stateDesc: biliArchiveStateLabel(archive)
+    },
+    videos: videos.map((video, index) => ({
+      index: Number(video.index || video.Index || index + 1),
+      title: String(video.title || video.Title || ""),
+      duration: Number(video.duration || video.Duration || 0),
+      status: Number(video.status || video.Status || 0),
+      statusDesc: String(video.status_desc || video.statusDesc || ""),
+      cid: video.cid || video.Cid || null,
+      filename: String(video.filename || video.Filename || ""),
+      failDesc: String(video.fail_desc || video.failDesc || "")
+    }))
+  };
+}
+
+function parseBiliWebArchiveDetail(data = {}) {
+  const pages = asArray(data.pages);
+  return {
+    source: "web-interface",
+    archive: {
+      bvid: String(data.bvid || ""),
+      aid: data.aid || null,
+      title: String(data.title || ""),
+      cover: String(data.pic || data.cover || ""),
+      tag: String(data.tname || ""),
+      tid: data.tid || null,
+      duration: Number(data.duration || 0),
+      isOnlySelf: 0,
+      state: null,
+      stateDesc: ""
+    },
+    videos: pages.map((page, index) => ({
+      index: Number(page.page || index + 1),
+      title: String(page.part || page.title || `P${index + 1}`),
+      duration: Number(page.duration || 0),
+      status: 0,
+      statusDesc: "",
+      cid: page.cid || null,
+      filename: "",
+      failDesc: ""
+    }))
+  };
+}
+
+function biliArchiveStateLabel(archive = {}, item = {}) {
+  const raw = String(archive.state_desc || archive.stateDesc || item?.state_panel?.name || item?.state_panel?.text || "").trim();
+  if (raw && !/^-?\d+$/.test(raw)) return raw;
+  const state = Number(archive.state ?? raw);
+  const isOnlySelf = Number(archive.is_only_self ?? archive.isOnlySelf ?? 0) === 1;
+  if (isOnlySelf && state === -50) return "稿件仅自己可见";
+  const labels = new Map([
+    [0, "已通过"],
+    [-1, "待审核"],
+    [-2, "未通过"],
+    [-3, "退回修改"],
+    [-4, "锁定"],
+    [-5, "管理员锁定"],
+    [-6, "修复待审"],
+    [-7, "暂缓审核"],
+    [-8, "补档待审"],
+    [-9, "等待转码"],
+    [-10, "延迟审核"],
+    [-11, "视频源待修"],
+    [-12, "转储失败"],
+    [-13, "允许评论待审"],
+    [-14, "临时回收站"],
+    [-15, "分发中"],
+    [-16, "转码失败"],
+    [-20, "创建未提交"],
+    [-30, "创建已提交"],
+    [-40, "定时发布"],
+    [-50, "仅自己可见"]
+  ]);
+  return labels.get(state) || (Number.isFinite(state) ? `状态 ${state}` : "");
 }
 
 function parseBiliupList(output) {
@@ -4766,8 +5831,11 @@ async function startBiliupLoginJob(tools, cookiePath, launch = true) {
   const job = createUploadJob("biliup-login", launch ? "正在打开扫码登录终端" : "已生成扫码登录脚本");
   const scriptPath = path.join(draftsDir, "biliup-login.cmd");
   job.scriptPath = scriptPath;
+  const invocation = getBiliupInvocation(tools);
   const args = ["-u", cookiePath, "login"];
-  const command = [tools.biliupPath, ...args].map(quoteArg).join(" ");
+  const fullArgs = [...invocation.argsPrefix, ...args];
+  const command = [invocation.executablePath, ...fullArgs].map(quoteArg).join(" ");
+  const scriptCommand = [quoteCmdArg(invocation.executablePath), ...fullArgs.map(quoteCmdArg)].join(" ");
   const script = [
     "@echo off",
     "chcp 65001 >nul",
@@ -4778,7 +5846,7 @@ async function startBiliupLoginJob(tools, cookiePath, launch = true) {
     "echo 登录成功后 cookie 会写入：",
     `echo ${cookiePath}`,
     "echo.",
-    `${quoteCmdArg(tools.biliupPath)} -u ${quoteCmdArg(cookiePath)} login`,
+    scriptCommand,
     "set LOGIN_EXIT=%ERRORLEVEL%",
     "echo.",
     "if %LOGIN_EXIT% EQU 0 (",
@@ -4876,9 +5944,9 @@ function runBiliupInstallJob(job) {
         await execFileLogged(job, pythonPath, ["-m", "venv", biliupVenvDir], { timeout: 1000 * 60 * 5 });
       }
       const venvPython = path.join(biliupVenvDir, "Scripts", "python.exe");
-      job.message = "正在安装 biliup==1.1.29";
+      job.message = `正在安装 biliup==${recommendedBiliupVersion}`;
       job.progress = 35;
-      await execFileLogged(job, venvPython, ["-m", "pip", "install", "--disable-pip-version-check", "biliup==1.1.29"], { timeout: 1000 * 60 * 10 });
+      await execFileLogged(job, venvPython, ["-m", "pip", "install", "--disable-pip-version-check", `biliup==${recommendedBiliupVersion}`], { timeout: 1000 * 60 * 10 });
       job.status = "ready";
       job.progress = 100;
       job.message = "本地 biliup 已安装";
@@ -4912,6 +5980,34 @@ async function execFileLogged(job, command, args, options = {}) {
   }
 }
 
+function killProcessTree(pid, job = null) {
+  if (!pid) return;
+  try {
+    if (process.platform === "win32") {
+      spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        timeout: 10000
+      });
+    } else {
+      try {
+        process.kill(-pid, "SIGTERM");
+      } catch {
+        process.kill(pid, "SIGTERM");
+      }
+      setTimeout(() => {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // already exited
+        }
+      }, 1500).unref?.();
+    }
+    if (job) appendJobLog(job, `\n[workbench] 已结束进程树 PID ${pid}\n`);
+  } catch (error) {
+    if (job) appendJobLog(job, `\n[workbench] 结束进程失败：${readableError(error)}\n`);
+  }
+}
+
 function runProcessJob(job, command, args, options = {}) {
   job.command = [command, ...args].map(quoteArg).join(" ");
   appendJobLog(job, `> ${job.command}\n`);
@@ -4926,7 +6022,7 @@ function runProcessJob(job, command, args, options = {}) {
   const timer = options.timeoutMs
     ? setTimeout(() => {
         appendJobLog(job, "\n[workbench] 任务超时，已请求结束进程。\n");
-        child.kill();
+        killProcessTree(child.pid, job);
       }, options.timeoutMs)
     : null;
 
@@ -5014,7 +6110,7 @@ function runSpawnLogged(job, command, args, options = {}) {
     const timer = options.timeoutMs
       ? setTimeout(() => {
           appendJobLog(job, "\n[workbench] 任务超时，已请求结束进程。\n");
-          child.kill();
+          killProcessTree(child.pid, job);
         }, options.timeoutMs)
       : null;
     child.stdout.on("data", (chunk) => {
@@ -5109,7 +6205,7 @@ async function getRoomDetail(roomPath) {
     const media = await getMediaMetadata(videoPath);
     const xml = findCompanionFile(videoPath, xmlFiles, ".xml");
     const subs = findCompanionFiles(videoPath, subtitleFiles);
-    const danmaku = xml ? parseDanmakuFile(xml, media.duration) : emptyDanmaku();
+    // Room list stays light: count danmaku only when opening the video context.
     const remuxTargetPath = path.extname(videoPath).toLowerCase() === ".flv"
       ? getFlvTargetPath(videoPath, settings.media)
       : null;
@@ -5126,8 +6222,8 @@ async function getRoomDetail(roomPath) {
       height: media.height,
       playable: isBrowserPlayable(videoPath),
       xml: xml ? { key: encodeKey(xml), path: xml, name: path.basename(xml) } : null,
-      danmakuCount: danmaku.total,
-      danmakuDuration: danmaku.duration,
+      danmakuCount: xml ? countDanmakuQuick(xml) : 0,
+      danmakuDuration: media.duration || 0,
       subtitles: subs.map((file) => ({ key: encodeKey(file), path: file, name: path.basename(file) })),
       remuxTarget: remuxTargetPath
         ? {
@@ -5217,6 +6313,16 @@ async function getMediaMetadata(videoPath) {
   }
   mediaCache.set(cacheKey, metadata);
   return metadata;
+}
+
+function countDanmakuQuick(xmlPath) {
+  try {
+    const text = fs.readFileSync(xmlPath, "utf8");
+    const matches = text.match(/<d[\s>]/g);
+    return matches ? matches.length : 0;
+  } catch {
+    return 0;
+  }
 }
 
 function parseDanmakuFile(xmlPath, mediaDuration) {
@@ -5365,8 +6471,12 @@ function roundTime(seconds) {
   return Math.round(Number(seconds || 0) * 10) / 10;
 }
 
-function getFallbackSliceDuration(context) {
+function getFallbackSliceDuration(context, options = {}) {
   const totalDuration = Math.max(Number(context?.duration || 0), Number(context?.media?.duration || 0), 1);
+  const requested = Number(options.clipDuration || options.duration || 0);
+  if (Number.isFinite(requested) && requested > 0) {
+    return Math.max(20, Math.min(600, Math.min(requested, totalDuration)));
+  }
   const maxSeconds = Math.max(1, Math.min(180, totalDuration));
   return Math.max(1, Math.min(maxSeconds, Math.max(20, Math.round(totalDuration * 0.08) || 90)));
 }
@@ -5398,7 +6508,7 @@ function buildHistogram(comments, duration, binSize) {
 function buildSliceCandidates(context, options) {
   const sources = new Set(Array.isArray(options.sources) && options.sources.length ? options.sources : ["danmaku"]);
   const precisionMode = String(options.precisionMode || "high");
-  const requestedDuration = getFallbackSliceDuration(context);
+  const requestedDuration = getFallbackSliceDuration(context, options);
   const count = Math.min(12, Math.max(1, Number(options.clipCount || 5)));
   const knownDuration = Math.max(Number(context.duration || 0), Number(context.media?.duration || 0));
   const totalDuration = knownDuration > 0 ? knownDuration : requestedDuration;
@@ -7534,7 +8644,7 @@ function findFirstFile(root, extensions) {
 function publicJob(job) {
   return {
     id: job.id,
-    status: job.status,
+    status: job.status === "completed" ? "ready" : job.status,
     progress: job.progress,
     message: job.message,
     outDir: job.outDir,
@@ -7696,6 +8806,14 @@ async function runFlvConvertJob(job, settings, roomPath = null, selectedVideoPat
   if (!roots[0]) {
     throw new Error("未设置录制素材目录。请先在设置页填写录制输出目录。");
   }
+  const mediaSettings = normalizeMediaSettings(settings.media || {});
+  const pipeline = describeMediaPipeline(mediaSettings);
+  const concurrency = Math.max(1, Math.min(4, Number(mediaSettings.convertConcurrency || 1)));
+  appendJobLog(job, `[pipeline] video=${pipeline.videoLabel}; audio=${pipeline.audio}; concurrency=${concurrency}; output=${pipeline.flvOutputMode}\n`);
+  if (pipeline.hw?.nvenc || pipeline.hw?.qsv || pipeline.hw?.amf) {
+    appendJobLog(job, `[hw] nvenc=${pipeline.hw.nvenc ? "yes" : "no"} qsv=${pipeline.hw.qsv ? "yes" : "no"} amf=${pipeline.hw.amf ? "yes" : "no"}\n`);
+  }
+
   const flvFiles = selectedVideoPaths.length
     ? dedupeVideoFiles(selectedVideoPaths.map((file) => {
         assertInsideRecordings(file);
@@ -7713,35 +8831,84 @@ async function runFlvConvertJob(job, settings, roomPath = null, selectedVideoPat
   }
 
   let converted = 0;
-  for (const file of flvFiles) {
-    const target = getFlvTargetPath(file, settings.media);
-    if (settings.media.skipIfMp4Exists !== false && fs.existsSync(target)) {
+  let failed = 0;
+  const total = flvFiles.length;
+  const queue = [...flvFiles];
+
+  async function convertOne(file) {
+    const target = getFlvTargetPath(file, mediaSettings);
+    const existingTarget = safeStat(target);
+    if (mediaSettings.skipIfMp4Exists !== false && existingTarget?.size) {
+      const existingMedia = await getMediaMetadata(target);
+      const existingDuration = Number(existingMedia.duration || 0);
       appendJobLog(job, `[skip] ${target}\n`);
+      if (mediaSettings.deleteSourceAfterConvert) {
+        if (existingDuration > 0) {
+          await fsp.rm(file, { force: true });
+          appendJobLog(job, `[delete] ${file}\n`);
+        } else {
+          appendJobLog(job, `[keep-source] existing MP4 looks incomplete, keep FLV: ${file}\n`);
+        }
+      }
       converted += 1;
-      job.progress = Math.max(5, Math.round((converted / flvFiles.length) * 100));
-      job.message = `已跳过已存在的 MP4（${converted}/${flvFiles.length}）`;
+      job.progress = Math.max(5, Math.round((converted / total) * 100));
+      job.message = mediaSettings.deleteSourceAfterConvert && existingDuration > 0
+        ? `已跳过已存在的 MP4，并删除源 FLV（${converted}/${total}）`
+        : `已跳过已存在的 MP4（${converted}/${total}）`;
       job.outputPath = target;
       job.updatedAt = new Date().toISOString();
-      continue;
+      return;
     }
+
     await fsp.mkdir(path.dirname(target), { recursive: true });
-    const args = buildFlvConvertArgs(file, target, settings.media);
-    job.progress = Math.max(5, Math.round((converted / flvFiles.length) * 100));
-    job.message = `正在转换 ${path.basename(file)}（${converted + 1}/${flvFiles.length}）`;
+    const args = buildFlvConvertArgs(file, target, mediaSettings);
+    job.progress = Math.max(5, Math.round((converted / total) * 100));
+    job.message = `正在转换 ${path.basename(file)}（${converted + 1}/${total}，并发 ${concurrency}）`;
     job.outputPath = target;
-    await runFfmpegSpawnLogged(job, args, { timeoutMs: 1000 * 60 * 60 * 4 });
-    if (settings.media.deleteSourceAfterConvert && fs.existsSync(target)) {
-      await fsp.rm(file, { force: true });
-      appendJobLog(job, `[delete] ${file}\n`);
-    }
-    converted += 1;
-    job.progress = Math.max(5, Math.round((converted / flvFiles.length) * 100));
     job.updatedAt = new Date().toISOString();
+    try {
+      await runFfmpegSpawnLogged(job, args, { timeoutMs: 1000 * 60 * 60 * 4 });
+      const outputMedia = await getMediaMetadata(target);
+      if (!(Number(outputMedia.duration || 0) > 0) && !(safeStat(target)?.size > 0)) {
+        throw new Error(`输出文件无效：${target}`);
+      }
+      if (mediaSettings.deleteSourceAfterConvert && fs.existsSync(target)) {
+        const duration = Number(outputMedia.duration || 0);
+        if (duration > 0) {
+          await fsp.rm(file, { force: true });
+          appendJobLog(job, `[delete] ${file}\n`);
+        } else {
+          appendJobLog(job, `[keep-source] converted MP4 duration missing, keep FLV: ${file}\n`);
+        }
+      }
+      converted += 1;
+      job.progress = Math.max(5, Math.round((converted / total) * 100));
+      job.updatedAt = new Date().toISOString();
+    } catch (error) {
+      failed += 1;
+      appendJobLog(job, `[error] ${path.basename(file)}: ${readableError(error)}\n`);
+      converted += 1;
+      job.progress = Math.max(5, Math.round((converted / total) * 100));
+      job.updatedAt = new Date().toISOString();
+    }
   }
 
-  job.status = "ready";
+  async function worker() {
+    while (queue.length) {
+      const file = queue.shift();
+      if (!file) break;
+      await convertOne(file);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, total) }, () => worker());
+  await Promise.all(workers);
+
+  job.status = failed && failed === total ? "error" : "ready";
   job.progress = 100;
-  job.message = `FLV 转 MP4 完成，共处理 ${flvFiles.length} 个文件。`;
+  job.message = failed
+    ? `FLV 转 MP4 完成：成功 ${total - failed}/${total}，失败 ${failed}。当前策略 ${pipeline.videoLabel}`
+    : `FLV 转 MP4 完成：处理了 ${total} 个文件。当前策略 ${pipeline.videoLabel}`;
   job.updatedAt = new Date().toISOString();
 }
 
@@ -8098,8 +9265,11 @@ function decodeAllowedKey(key) {
 
 function assertAllowedFile(filePath) {
   const resolved = path.resolve(filePath);
-  const allowedRoots = [getRecordingsRoot(), workbenchRoot].filter(Boolean);
-  if (!allowedRoots.some((root) => resolved === root || resolved.startsWith(`${root}${path.sep}`))) {
+  const allowedRoots = [getRecordingsRoot(), workbenchRoot, path.dirname(workbenchRoot)].filter(Boolean);
+  if (!allowedRoots.some((root) => {
+    const rootResolved = path.resolve(root);
+    return resolved === rootResolved || resolved.startsWith(`${rootResolved}${path.sep}`);
+  })) {
     throw new Error("Path is outside allowed workspace roots.");
   }
 }

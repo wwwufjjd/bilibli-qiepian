@@ -123,6 +123,7 @@ test.beforeEach(async ({ page }) => {
   });
 
   await page.route(`**/api/recording/rooms/${roomId}/start`, async (route) => {
+    expect(route.request().postDataJSON()).toMatchObject({ oneShot: true });
     roomStatus = {
       ...roomStatus,
       taskStatus: "recording",
@@ -726,7 +727,7 @@ test("extract-audio mode tells users it will not generate subtitles", async ({ p
           vision: { provider: "", wireApi: "responses", endpoint: "", apiKey: "", model: "", sendFrames: true, sendAudio: false, sendSubtitles: true, sendDanmaku: true },
           cover: { provider: "frame-template", endpoint: "", apiKey: "", model: "", stylePrompt: "" },
           media: { flvOutputMode: "same-dir", deleteSourceAfterConvert: false, skipIfMp4Exists: true },
-          automation: { enabled: false, autoAnalyze: false, autoExport: false, autoUpload: false, uploadPolicy: "review", clipDuration: 30, clipCount: 2, sources: ["danmaku", "subtitle"], minScore: 72 }
+          automation: { enabled: false, autoAnalyze: false, autoExport: false, autoUpload: false, uploadPolicy: "review", clipDuration: 30, clipCount: 2, sources: ["danmaku"], minScore: 72 }
         }
       }
     })
@@ -1008,8 +1009,9 @@ test("upload execution stays disabled until cookie exists", async ({ page }) => 
 });
 
 test("failure states expose cause log and next action", async ({ page }) => {
-  await page.route(`**/api/recording/rooms/${roomId}/start`, (route) =>
-    route.fulfill({
+  await page.route(`**/api/recording/rooms/${roomId}/start`, (route) => {
+    expect(route.request().postDataJSON()).toMatchObject({ oneShot: true });
+    return route.fulfill({
       status: 409,
       json: {
         error: "invalid room",
@@ -1018,8 +1020,8 @@ test("failure states expose cause log and next action", async ({ page }) => {
         message: "Bilibili room was not found",
         nextAction: "edit"
       }
-    })
-  );
+    });
+  });
 
   await page.goto("/");
   await page.getByTestId(`start-room-${roomId}`).click();
@@ -1252,11 +1254,14 @@ test("task center shows automation clips, exports, and upload draft path", async
   await page.goto("/");
   await page.getByRole("button", { name: /任务/ }).click();
   await expect(page.getByTestId("automation-task-section")).toContainText("自动切片");
-  await expect(page.getByTestId("automation-task-section")).toContainText("已过滤 9");
+  await expect(page.getByTestId("automation-task-section")).toContainText("无高置信 9");
   await expect(page.getByTestId("automation-task-section").locator(".automation-strip").first()).not.toContainText("No high-confidence");
   await expect(page.locator(".automation-task").first()).toContainText("clip.mp4");
   await expect(page.getByTestId("automation-task-auto-task-ready-1")).toContainText("投稿草稿已生成");
+  await expect(page.getByTestId("automation-task-auto-task-ready-1")).toContainText("切片草稿 1");
+  await expect(page.getByTestId("automation-task-auto-task-ready-1")).toContainText("投稿草稿");
   await expect(page.getByTestId("automation-task-auto-task-ready-1")).toContainText("导出 1");
+  await expect(page.getByTestId("automation-project-auto-task-ready-1")).toContainText("projects/clip.json");
   await expect(page.getByTestId("automation-draft-auto-task-ready-1")).toContainText("automation-auto-task-ready-1.json");
 });
 

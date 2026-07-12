@@ -26,10 +26,13 @@ export type UploadTools = {
   biliupPath: string | null;
   bilitoolPath: string | null;
   biliupSource: "system" | "workspace" | null;
+  biliupArgsPrefix?: string[];
   biliupVersion: string | null;
   testedBiliupVersion: string;
   cookiePath: string;
   cookieExists: boolean;
+  cookieSource?: string;
+  cookieCandidates?: UploadCookieCandidate[];
   workspaceInstallPath: string;
   capabilities: {
     uploadMultiPart: boolean;
@@ -40,6 +43,12 @@ export type UploadTools = {
     commandHelpVerifiedAt: string;
     unsupportedOrUnverified: string[];
   };
+};
+
+export type UploadCookieCandidate = {
+  path: string;
+  exists: boolean;
+  source: string;
 };
 
 export type Room = {
@@ -309,10 +318,12 @@ export type ServiceSettings = {
     deleteSourceAfterConvert: boolean;
     skipIfMp4Exists: boolean;
     videoTranscodeMode: "compress" | "copy" | string;
+    videoEncoder?: "auto" | "libx264" | "nvenc" | "qsv" | "amf" | string;
     videoCrf: number;
     videoPreset: string;
     audioTranscodeMode: "aac" | "copy" | "lossless" | string;
     audioBitrateKbps: number;
+    convertConcurrency?: number;
   };
   automation: AutomationSettings;
 };
@@ -431,6 +442,12 @@ export type RecordingSettings = {
   remuxToMp4: boolean;
   injectExtraMetadata: boolean;
   deleteSourceAfterRemux: string;
+  mergeReconnectSegments: boolean;
+  reconnectMergeWindowSeconds: number;
+  mergedSegmentArchiveDir: string;
+  shortRecordingCleanupEnabled: boolean;
+  shortRecordingMinSeconds: number;
+  shortRecordingArchiveDir: string;
   spaceCheckIntervalSeconds: number;
   spaceThresholdMb: number;
   recycleRecords: boolean;
@@ -650,13 +667,16 @@ export type UploadPreflight = {
     effectiveDraft: UploadDraft;
   };
   command: string;
+  cookie?: UploadCookieCandidate & { candidates?: UploadCookieCandidate[] };
   tools: UploadTools;
 };
 
 export type UploadHistoryItem = {
   bvid: string;
+  aid?: number | null;
   title: string;
   status: string;
+  partCount?: number;
 };
 
 export type RemoteArchiveInfo = {
@@ -688,6 +708,12 @@ export type UploadHistoryResponse = {
   message?: string;
   command?: string;
   output?: string;
+  needsLogin?: boolean;
+  exitCode?: number | string | null;
+  source?: string;
+  memberApiError?: string;
+  cookie?: UploadCookieCandidate & { candidates?: UploadCookieCandidate[] };
+  tools?: UploadTools;
   archives?: UploadHistoryItem[];
 };
 
@@ -696,6 +722,12 @@ export type UploadArchiveResponse = {
   message?: string;
   command?: string;
   output?: string;
+  needsLogin?: boolean;
+  exitCode?: number | string | null;
+  source?: string;
+  memberApiError?: string;
+  cookie?: UploadCookieCandidate & { candidates?: UploadCookieCandidate[] };
+  tools?: UploadTools;
   archive?: RemoteArchiveInfo;
   videos?: RemoteArchivePart[];
 };

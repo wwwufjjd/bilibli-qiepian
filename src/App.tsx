@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import {
   Activity,
   BadgeCheck,
@@ -29,7 +29,11 @@ import {
 } from "lucide-react";
 import {
   addFixedRoom,
+  analyzeAllRecordingsAutomation,
   convertAllFlv,
+  loadAutomationUploadDraft,
+  loadUploadDraft,
+  requeueAutomationJob,
   deleteFixedRoom,
   deleteMaterialRoom,
   extractCover,
@@ -133,10 +137,14 @@ type AutomationSummary = {
   total: number;
   running: number;
   ready: number;
+  draft: number;
+  uploadDrafts: number;
   accepted: number;
   exported: number;
   filtered: number;
+  failed: number;
   blocked: number;
+  stale: number;
   lastStage: string;
   lastMessage: string;
   latestJob: AutomationJob | null;
@@ -168,7 +176,10 @@ function rememberLocalHiddenMaterialRoom(roomKey: string) {
 }
 
 function filterVisibleMaterialRooms(rooms: Room[]) {
+  // Server already filters persisted hidden rooms. Local storage is only an optimistic
+  // cache for this browser when a hide request has not yet been accepted by the server.
   const hidden = readLocalHiddenMaterialRooms();
+  if (!hidden.size) return rooms;
   return rooms.filter((room) => !hidden.has(room.key));
 }
 
@@ -219,6 +230,20 @@ function materialGroupForRoomId(rooms: Room[], roomId: string) {
   return groupMaterialRooms(rooms).find((room) => room.roomId && room.roomId === roomId) || null;
 }
 
+function findMaterialRoomForAutomationJob(rooms: Room[], job: AutomationJob) {
+  if (job.roomId) {
+    const byRoomId = materialGroupForRoomId(rooms, job.roomId);
+    if (byRoomId) return byRoomId;
+  }
+  const videoPath = normalizeComparePath(job.videoPath);
+  return groupMaterialRooms(rooms).find((room) => {
+    return materialRoomMembers(room).some((member) => {
+      const roomPath = normalizeComparePath(member.path);
+      return roomPath && (videoPath === roomPath || videoPath.startsWith(`${roomPath}/`));
+    });
+  }) || null;
+}
+
 function mergeRoomDetails(group: Room, details: RoomDetail[]): RoomDetail {
   const seen = new Set<string>();
   const videos = details
@@ -244,6 +269,10 @@ function mergeRoomDetails(group: Room, details: RoomDetail[]): RoomDetail {
 export function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const monitorRequestSeq = useRef(0);
+  const automationNotificationState = useRef<Map<string, string>>(new Map());
+  const automationNotificationsPrimed = useRef(false);
+  const openVideoRequestSeq = useRef(0);
+  const errorToastTimer = useRef<number | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [rooms, setRooms] = useState<Room[]>([]);
   const [fixedRooms, setFixedRooms] = useState<FixedRoom[]>([]);
@@ -274,6 +303,7 @@ export function App() {
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [pendingUploadDraft, setPendingUploadDraft] = useState<{ path: string; draft: UploadDraft; sourceJobId?: string } | null>(null);
   const activeRecordingKey = useMemo(
     () =>
       fixedRooms
@@ -327,6 +357,29 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    const next = new Map<string, string>();
+    for (const job of automationJobs) {
+      const signature = automationNotificationSignature(job);
+      next.set(job.id, signature);
+      const previous = automationNotificationState.current.get(job.id);
+      if (!automationNotificationsPrimed.current || previous === signature) continue;
+      notifyAutomationJobTransition(job);
+    }
+    automationNotificationState.current = next;
+    automationNotificationsPrimed.current = true;
+  }, [automationJobs]);
+
+  // auto-dismiss-error
+  useEffect(() => {
+    if (!error) return;
+    if (errorToastTimer.current) window.clearTimeout(errorToastTimer.current);
+    errorToastTimer.current = window.setTimeout(() => setError(null), 8000);
+    return () => {
+      if (errorToastTimer.current) window.clearTimeout(errorToastTimer.current);
+    };
+  }, [error]);
+
+  useEffect(() => {
     if (!activeRecordingKey) return;
     let cancelled = false;
     async function refreshRunningRooms() {
@@ -347,7 +400,7 @@ export function App() {
       }
     }
     void refreshRunningRooms();
-    const id = window.setInterval(() => void refreshRunningRooms(), 1800);
+    const id = window.setInterval(() => void refreshRunningRooms(), 2500);
     return () => {
       cancelled = true;
       window.clearInterval(id);
@@ -379,7 +432,7 @@ export function App() {
       }
     }
     void refreshMonitorState();
-    const id = window.setInterval(() => void refreshMonitorState(), 2000);
+    const id = window.setInterval(() => void refreshMonitorState(), 4000);
     return () => {
       cancelled = true;
       window.clearInterval(id);
@@ -464,6 +517,56 @@ export function App() {
     }
   }
 
+  function notifyAutomationJobTransition(job: AutomationJob) {
+    const name = automationVideoName(job);
+    if (job.status === "error") {
+      const text = `AI 切片失败：${name}。${job.error || job.message || "请在任务中心查看详情。"}`;
+      setError(text);
+      return;
+    }
+    if (job.status === "ready" && job.acceptedClips?.length) {
+      const text = `AI 切片成功：${name}，生成 ${job.acceptedClips.length} 个切片草稿。`;
+      setMessage(text);
+      return;
+    }
+    if (job.status === "ready" && String(job.stage || "").includes("no-high-confidence")) {
+      const text = `AI 切片无高置信：${name}，已完成分析但没有通过阈值的片段。`;
+      setMessage(text);
+    }
+  }
+
+  async function requeueAutomationJobFromUi(job: AutomationJob) {
+    setBusy(`automation-requeue-${job.id}`);
+    setError(null);
+    try {
+      await requeueAutomationJob(job.id, { force: true });
+      await refreshAutomationJobs();
+      setMessage(`已重新排队：${automationVideoName(job)}`);
+    } catch (err) {
+      setError(readableError(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function runAiSlicingAllRecordings() {
+    setBusy("automation-all");
+    setError(null);
+    try {
+      const result = await analyzeAllRecordingsAutomation();
+      await refreshAutomationJobs();
+      if (result.queued) {
+        setMessage(`已排队 ${result.queued} 个录制文件做 AI 切片；后台会按顺序分析。`);
+      } else {
+        setMessage(`没有新的录制文件需要排队；已扫描 ${result.scanned} 个，已有任务 ${result.skippedExisting} 个。`);
+      }
+    } catch (err) {
+      setError(`AI 切片全部排队失败：${readableError(err)}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
   function applyRecordingStatus(status: RecordingRoomStatus & { roomId: string }) {
     setRecordingSummary(status);
     setFixedRooms((prev) => prev.map((room) => (room.roomId === status.roomId ? { ...room, ...status } : room)));
@@ -506,7 +609,7 @@ export function App() {
         if (!prev?.roomId) return prev;
         return result.rooms.find((room) => room.roomId === prev.roomId) || prev;
       });
-      setMessage(`${enabled ? "已开启" : "已关闭"}房间 ${roomId} 的自动录制。`);
+      setMessage(`${enabled ? "已开启" : "已关闭"}房间 ${roomId} 的监控录制。`);
     } catch (err) {
       setError(readableError(err));
     } finally {
@@ -536,7 +639,7 @@ export function App() {
     const memberKeys = new Set(members.map((item) => item.key));
     const title = room.name || room.folderName || room.roomId || "这个素材房间";
     const scope = members.length > 1 ? `「${title}」的 ${members.length} 个素材目录` : `「${title}」`;
-    const confirmed = window.confirm(`从素材库隐藏${scope}？硬盘里的视频和弹幕文件不会删除。`);
+    const confirmed = window.confirm(`从素材库隐藏${scope}？硬盘里的视频和弹幕文件不会删除。\n\n隐藏记录保存在服务端，刷新后仍然生效。`);
     if (!confirmed) return;
     setBusy(`material-delete-${room.key}`);
     setError(null);
@@ -548,8 +651,8 @@ export function App() {
         const result = await deleteMaterialRoom(item.key);
         latestRooms = result.rooms;
       }
-      if (latestRooms) setRooms(filterVisibleMaterialRooms(latestRooms));
-      setMessage(`已从素材库隐藏${scope}，本地文件已保留。`);
+      if (latestRooms) setRooms(latestRooms);
+      setMessage(`已从素材库隐藏${scope}（服务端已记录），本地文件已保留。`);
     } catch (err) {
       const reason = readableError(err);
       const waitingForRestart = /404|Cannot DELETE|Not Found/i.test(reason);
@@ -570,7 +673,7 @@ export function App() {
     setBusy(`recording-${action}-${roomId}`);
     setError(null);
     try {
-      const status = await postRecordingRoomAction(roomId, action);
+      const status = await postRecordingRoomAction(roomId, action, action === "start" ? { oneShot: true } : {});
       applyRecordingStatus(status);
       if (action === "stop" && status.refreshed) {
         const roomPayload = await getJson<{ root: string; rooms: Room[] }>("/api/rooms");
@@ -653,6 +756,71 @@ export function App() {
     }
   }
 
+  async function openAutomationJobTarget(job: AutomationJob, target: "video" | "clips" | "upload") {
+    if (target === "upload") {
+      setBusy(`automation-open-${job.id}`);
+      setError(null);
+      try {
+        if (!job.uploadDraftPath) {
+          setActiveView("upload");
+          setMessage("这个任务还没有投稿草稿。");
+          return;
+        }
+        const payload = await loadAutomationUploadDraft(job.id);
+        setPendingUploadDraft({
+          path: payload.path,
+          draft: payload.draft,
+          sourceJobId: job.id
+        });
+        setActiveView("upload");
+        setMessage(`已加载自动切片投稿草稿：${automationVideoName(job)}`);
+      } catch (err) {
+        setError(readableError(err));
+        setActiveView("upload");
+      } finally {
+        setBusy(null);
+      }
+      return;
+    }
+    setBusy(`automation-open-${job.id}`);
+    setError(null);
+    try {
+      const videoPath = normalizeComparePath(job.videoPath);
+      let latestRooms = rooms;
+      let materialRoom = findMaterialRoomForAutomationJob(latestRooms, job);
+      if (!materialRoom) {
+        const roomPayload = await getJson<{ root: string; rooms: Room[] }>("/api/rooms");
+        latestRooms = filterVisibleMaterialRooms(roomPayload.rooms);
+        setRooms(latestRooms);
+        materialRoom = findMaterialRoomForAutomationJob(latestRooms, job);
+      }
+      if (!materialRoom) throw new Error("没有在素材库里找到这个自动切片任务对应的视频。");
+      const details = await Promise.all(
+        materialRoomMembers(materialRoom).map((item) => getJson<RoomDetail>(`/api/rooms/${encodeURIComponent(item.key)}`))
+      );
+      const detail = details.length > 1 ? mergeRoomDetails(materialRoom, details) : details[0];
+      const video = detail.videos.find((item) => normalizeComparePath(item.path) === videoPath);
+      if (!video) throw new Error("找到了房间，但没有找到任务对应的视频文件；可以刷新素材库后再试。");
+      setRoomDetail(detail);
+      setSelectedMaterialVideoKeys([]);
+      setActiveView("workspace");
+      await openVideo(video);
+      if (target === "clips" && job.acceptedClips?.length) {
+        setProject((prev) => ({
+          ...prev,
+          clips: job.acceptedClips.map((clip) => ({ ...clip, status: clip.status || "draft" }))
+        }));
+        setMessage(`已打开 ${job.acceptedClips.length} 个切片草稿。`);
+      } else if (target === "clips") {
+        setMessage("已打开素材；这个任务暂时没有切片草稿。");
+      }
+    } catch (err) {
+      setError(readableError(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   function resetEmptyWorkspaceState() {
     setSelectedVideo(null);
     setContext(null);
@@ -668,6 +836,7 @@ export function App() {
   }
 
   async function openVideo(video: VideoAsset) {
+    const requestId = ++openVideoRequestSeq.current;
     setBusy("video");
     setError(null);
     setSelectedVideo(video);
@@ -676,6 +845,7 @@ export function App() {
         getJson<VideoContext>(`/api/videos/${video.key}/context`),
         getJson<ProjectState>(`/api/projects/${video.key}`)
       ]);
+      if (requestId !== openVideoRequestSeq.current) return;
       setContext(loadedContext);
       setProject({
         clips: loadedProject.clips || [],
@@ -693,11 +863,12 @@ export function App() {
       const safeDuration = loadedContext.duration || configuredDuration;
       const initialDuration = Math.min(configuredDuration, safeDuration);
       setClipDuration(Math.max(20, Math.round(initialDuration)));
-      setSelectionEnd(initialDuration);
+      setSelectionEnd(Math.max(1, roundTime(initialDuration)));
     } catch (err) {
+      if (requestId !== openVideoRequestSeq.current) return;
       setError(readableError(err));
     } finally {
-      setBusy(null);
+      if (requestId === openVideoRequestSeq.current) setBusy(null);
     }
   }
 
@@ -772,6 +943,7 @@ export function App() {
         videoKey: context.key,
         sources,
         clipCount,
+        clipDuration,
         subtitles: editedSubtitles,
         danmakuEdits: project.danmakuEdits
       };
@@ -825,13 +997,21 @@ export function App() {
   }
 
   function addClip(candidate?: ClipCandidate) {
+    if (!candidate) {
+      const start = Math.min(selectionStart, selectionEnd);
+      const end = Math.max(selectionStart, selectionEnd);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end - start < 1) {
+        setError("请先选择至少 1 秒的有效切片区间。");
+        return;
+      }
+    }
     const clip: ClipDraft = candidate
       ? { ...candidate, status: "draft" }
       : {
           id: `manual-${Date.now()}`,
           title: `${context?.room.name || "手动"} 切片`,
-          start: selectionStart,
-          end: selectionEnd,
+          start: Math.min(selectionStart, selectionEnd),
+          end: Math.max(selectionStart, selectionEnd),
           score: 0,
           reason: "手动选择的切片区间。",
           evidence: [],
@@ -844,8 +1024,19 @@ export function App() {
   function updateClip(id: string, patch: Partial<ClipDraft>) {
     setProject((prev) => ({
       ...prev,
-      clips: prev.clips.map((clip) => (clip.id === id ? { ...clip, ...patch } : clip))
+      clips: prev.clips.map((clip) => {
+        if (clip.id !== id) return clip;
+        const next = { ...clip, ...patch };
+        if (Number.isFinite(next.start) && Number.isFinite(next.end) && next.end < next.start) {
+          return { ...next, end: next.start };
+        }
+        return next;
+      })
     }));
+  }
+
+  function removeClip(id: string) {
+    setProject((prev) => ({ ...prev, clips: prev.clips.filter((clip) => clip.id !== id) }));
   }
 
   async function exportClip(clip: ClipDraft) {
@@ -967,12 +1158,14 @@ export function App() {
       busyKey: string;
       label: string;
       writeBack?: boolean;
+      manageBusy?: boolean;
       asrOverride?: Partial<ServiceSettings["asr"]>;
     }
   ) {
     if (!context) return;
     if (guardActiveRecordingAction("生成字幕")) return;
-    setBusy(options.busyKey);
+    const manageBusy = options.manageBusy !== false;
+    if (manageBusy) setBusy(options.busyKey);
     setError(null);
     try {
       const job = await startAsr({
@@ -999,7 +1192,7 @@ export function App() {
       setError(readableError(err));
       return null;
     } finally {
-      setBusy(null);
+      if (manageBusy) setBusy(null);
     }
   }
 
@@ -1023,12 +1216,14 @@ export function App() {
         busyKey: "asr-compare",
         label: "Fun-ASR",
         writeBack: false,
+        manageBusy: false,
         asrOverride: { mode: "funasr-local", provider: "funasr-nano" }
       });
       const qwen = await runAsrForRange(selectionStart, selectionEnd, {
         busyKey: "asr-compare",
         label: "Qwen3-ASR",
         writeBack: false,
+        manageBusy: false,
         asrOverride: { mode: "qwen3-local", provider: "qwen3-asr-gguf" }
       });
       setAsrComparison({
@@ -1150,7 +1345,12 @@ export function App() {
         </div>
       </header>
 
-      {error ? <div className="toast error">{error}</div> : null}
+      {error ? (
+        <div className="toast error" role="alert">
+          <span>{error}</span>
+          <button type="button" className="toast-close" onClick={() => setError(null)} aria-label="关闭错误提示">×</button>
+        </div>
+      ) : null}
       {message ? <div className="toast" onAnimationEnd={() => setMessage(null)}>{message}</div> : null}
 
       <main className={shellClass}>
@@ -1223,8 +1423,14 @@ export function App() {
               onVideoSelect={(video) => void openVideo(video)}
               onTimeUpdate={setCurrentTime}
               onSeek={seekTo}
-              onSelectionStart={setSelectionStart}
-              onSelectionEnd={setSelectionEnd}
+              onSelectionStart={(time) => {
+                setSelectionStart(roundTime(time));
+                setSelectionEnd((end) => (end < time ? roundTime(time + 1) : end));
+              }}
+              onSelectionEnd={(time) => {
+                setSelectionEnd(roundTime(time));
+                setSelectionStart((start) => (start > time ? roundTime(Math.max(0, time - 1)) : start));
+              }}
               onSourceToggle={(source) => setSources((prev) => toggleValue(prev, source))}
               onClipCount={setClipCount}
               onRunAi={() => void runAiSlicing()}
@@ -1232,6 +1438,7 @@ export function App() {
               onPreviewClip={previewClip}
               onAddClip={addClip}
               onUpdateClip={updateClip}
+              onRemoveClip={removeClip}
               onExportClip={(clip) => void exportClip(clip)}
               onPackageClip={(clip) => void packageClipForModel(clip)}
               onExtractCover={(clip) => void extractClipCover(clip)}
@@ -1252,6 +1459,8 @@ export function App() {
 
           {activeView === "upload" ? (
             <UploadView
+              externalDraft={pendingUploadDraft}
+              onConsumeExternalDraft={() => setPendingUploadDraft(null)}
               tools={settings?.uploadTools || null}
               defaults={settings?.uploadDefaults || {}}
               roomDetail={roomDetail}
@@ -1261,7 +1470,15 @@ export function App() {
             />
           ) : null}
 
-          {activeView === "tasks" ? <TaskCenterView automationJobs={automationJobs} /> : null}
+          {activeView === "tasks" ? (
+            <TaskCenterView
+              automationJobs={automationJobs}
+              busy={busy}
+              onAnalyzeAll={runAiSlicingAllRecordings}
+              onOpenAutomationJob={(job, target) => void openAutomationJobTarget(job, target)}
+              onRequeueAutomationJob={(job) => void requeueAutomationJobFromUi(job)}
+            />
+          ) : null}
 
           {activeView === "settings" ? (
             <SettingsView
@@ -1270,6 +1487,7 @@ export function App() {
               uploadTools={settings?.uploadTools || null}
               recordingRootCandidates={settings?.recordingRootCandidates || []}
               onSave={async (value) => {
+                const previousRoot = settings?.recordingsRoot || settings?.serviceSettings?.recordingsRoot || "";
                 await saveServiceSettings(value);
                 const [latest, roomPayload, monitorPayload] = await Promise.all([
                   loadSettings(),
@@ -1279,11 +1497,16 @@ export function App() {
                 setSettings(latest);
                 setRooms(filterVisibleMaterialRooms(roomPayload.rooms));
                 if (monitorPayload) setRecordingMonitor(monitorPayload);
-                setRoomDetail(null);
-                setSelectedVideo(null);
-                setContext(null);
-                setProject(emptyProject);
-                setMessage("服务设置已保存，录制素材已重新扫描。");
+                const nextRoot = latest.recordingsRoot || latest.serviceSettings?.recordingsRoot || "";
+                if (previousRoot && nextRoot && previousRoot !== nextRoot) {
+                  setRoomDetail(null);
+                  setSelectedVideo(null);
+                  setContext(null);
+                  setProject(emptyProject);
+                  setMessage("服务设置已保存；录制目录已切换，已回到素材库。");
+                } else {
+                  setMessage("服务设置已保存。");
+                }
               }}
               onPrepareAsr={async (value) => {
                 const result = await prepareAsrModel({
@@ -1837,9 +2060,13 @@ function AutomationSummaryStrip({ summary, compact = false }: { summary: Automat
         {summary.running ? "运行中" : summary.ready ? "切片就绪" : summary.lastStage || "等待分析"}
       </span>
       <span className="automation-pill">任务 {summary.total}</span>
+      <span className={`automation-pill ${summary.draft ? "draft" : "muted"}`}>切片草稿 {summary.draft}</span>
+      {summary.uploadDrafts ? <span className="automation-pill draft">投稿草稿 {summary.uploadDrafts}</span> : null}
       <span className="automation-pill">采纳 {summary.accepted}</span>
       {summary.exported ? <span className="automation-pill ready">导出 {summary.exported}</span> : null}
-      {summary.filtered ? <span className="automation-pill muted">已过滤 {summary.filtered}</span> : null}
+      {summary.filtered ? <span className="automation-pill filtered">无高置信 {summary.filtered}</span> : null}
+      {summary.stale ? <span className="automation-pill stale">疑似卡住 {summary.stale}</span> : null}
+      {summary.failed ? <span className="automation-pill blocked">失败 {summary.failed}</span> : null}
       {summary.blocked ? <span className="automation-pill blocked">需处理 {summary.blocked}</span> : null}
       {!compact && summary.lastMessage ? <span className="automation-note">{summary.lastMessage}</span> : null}
     </div>
@@ -1873,11 +2100,15 @@ function summarizeAutomationJobs(jobs: AutomationJob[]): AutomationSummary {
     total: jobs.length,
     running: jobs.filter((job) => job.status === "running" || job.status === "queued").length,
     ready: jobs.filter((job) => job.status === "ready").length,
+    draft: jobs.filter((job) => (job.acceptedClips?.length || 0) > 0).length,
+    uploadDrafts: jobs.filter((job) => Boolean(job.uploadDraftPath)).length,
     accepted: jobs.reduce((count, job) => count + (job.acceptedClips?.length || 0), 0),
     exported: jobs.reduce((count, job) => count + (job.acceptedClips || []).filter((clip) => clip.status === "exported" || clip.exportPath).length, 0),
     filtered: jobs.filter((job) => String(job.stage || "").includes("no-high-confidence")).length,
-    blocked: jobs.filter((job) => job.status === "error" || String(job.stage || "").includes("blocked")).length,
-    lastStage: latestJob?.stage || "",
+    failed: jobs.filter((job) => job.status === "error").length,
+    blocked: jobs.filter((job) => job.status !== "error" && String(job.stage || "").includes("blocked")).length,
+    stale: jobs.filter(isAutomationJobStale).length,
+    lastStage: latestJob ? automationStageLabel(latestJob) : "",
     lastMessage: latestStage.includes("no-high-confidence") ? "" : (latestJob?.message || ""),
     latestJob
   };
@@ -1885,22 +2116,27 @@ function summarizeAutomationJobs(jobs: AutomationJob[]): AutomationSummary {
 
 function automationStageLabel(job: AutomationJob) {
   const stage = String(job.stage || "");
+  if (isAutomationJobStale(job)) return "疑似卡住";
   if (job.status === "queued") return "等待分析";
   if (job.status === "running" && stage.includes("export")) return "正在导出";
   if (job.status === "running") return "正在分析";
-  if (job.status === "error") return "异常";
+  if (job.status === "error") return "失败";
   if (stage === "upload-draft-ready") return "投稿草稿已生成";
   if (stage === "upload-preflight-blocked") return "投稿预检未通过";
   if (stage === "upload-started") return "投稿任务已启动";
   if (stage === "exported") return "切片已导出";
-  if (stage === "clips-ready") return "高置信片段已生成";
-  if (stage.includes("no-high-confidence")) return "没有高置信片段";
+  if (stage === "clips-ready") return "切片草稿已生成";
+  if (stage.includes("no-high-confidence")) return "无高置信片段";
   return stage || "自动切片";
 }
 
 function automationStatusClass(job: AutomationJob) {
-  if (job.status === "error" || String(job.stage || "").includes("blocked") || String(job.stage || "").includes("no-high-confidence")) return "error";
+  const stage = String(job.stage || "");
+  if (job.status === "error" || stage.includes("blocked")) return "error";
+  if (isAutomationJobStale(job)) return "stale";
+  if (stage.includes("no-high-confidence")) return "filtered";
   if (job.status === "running" || job.status === "queued") return "running";
+  if (job.uploadDraftPath || job.acceptedClips?.length) return "draft";
   return "ready";
 }
 
@@ -1912,7 +2148,37 @@ function automationProgress(job: AutomationJob) {
   if (job.uploadDraftPath || job.uploadJobId) return 100;
   if (job.exportedClips?.length) return 90;
   if (job.acceptedClips?.length) return 70;
+  if (String(job.stage || "").includes("no-high-confidence")) return 100;
   return 35;
+}
+
+function isAutomationJobStale(job: AutomationJob) {
+  if (job.status !== "running" && job.status !== "queued") return false;
+  const updatedAt = Date.parse(job.updatedAt || job.createdAt || "");
+  if (!Number.isFinite(updatedAt)) return false;
+  return Date.now() - updatedAt > 15 * 60 * 1000;
+}
+
+function automationJobMessage(job: AutomationJob) {
+  const stage = String(job.stage || "");
+  if (job.status === "error") return job.error || job.message || "AI 切片失败，需要查看错误。";
+  if (isAutomationJobStale(job)) return job.message || "任务长时间没有更新，可能卡在模型调用、导出或投稿步骤。";
+  if (stage.includes("no-high-confidence")) return "分析已完成，但没有片段达到当前高置信阈值；这不是接口失败。";
+  if (job.uploadDraftPath) return "已生成投稿草稿，可以到上传工作台复核。";
+  if (job.acceptedClips?.length) return "已生成切片草稿，可以在工作区复核。";
+  return job.message || automationStageLabel(job);
+}
+
+function automationNotificationSignature(job: AutomationJob) {
+  return [
+    job.status || "",
+    job.stage || "",
+    job.acceptedClips?.length || 0,
+    job.exportedClips?.length || 0,
+    job.uploadDraftPath || "",
+    job.error || "",
+    job.message || ""
+  ].join("|");
 }
 
 function automationVideoName(job: AutomationJob) {
@@ -1920,12 +2186,88 @@ function automationVideoName(job: AutomationJob) {
   return normalized.split("/").filter(Boolean).pop() || job.videoPath || "录制视频";
 }
 
-function AutomationJobCard({ job }: { job: AutomationJob }) {
+function automationOutcome(job: AutomationJob) {
+  const stage = String(job.stage || "");
+  if (job.status === "error") return { label: "失败", className: "bad" };
+  if (isAutomationJobStale(job)) return { label: "疑似卡住", className: "stale" };
+  if (job.status === "queued") return { label: "等待", className: "running" };
+  if (job.status === "running") return { label: stage.includes("export") ? "导出中" : "分析中", className: "running" };
+  if (job.uploadDraftPath) return { label: "投稿草稿", className: "draft" };
+  if (job.exportedClips?.length) return { label: "已导出", className: "ready" };
+  if (job.acceptedClips?.length) return { label: "成功", className: "ready" };
+  if (stage.includes("no-high-confidence")) return { label: "无高置信", className: "filtered" };
+  return { label: automationStageLabel(job), className: "muted" };
+}
+
+type AutomationJobTarget = "video" | "clips" | "upload";
+
+function AutomationJobsTable({
+  jobs,
+  onOpen,
+  onRequeue
+}: {
+  jobs: AutomationJob[];
+  onOpen: (job: AutomationJob, target: AutomationJobTarget) => void;
+  onRequeue?: (job: AutomationJob) => void;
+}) {
+  if (!jobs.length) return null;
+  const rows = sortAutomationJobsForDisplay(jobs);
+  return (
+    <div className="automation-status-table" data-testid="automation-status-table">
+      <div className="automation-status-row head">
+        <span>视频</span>
+        <span>状态</span>
+        <span>候选</span>
+        <span>草稿</span>
+        <span>导出/投稿</span>
+        <span>提示 / 错误</span>
+        <span>操作</span>
+        <span>更新时间</span>
+      </div>
+      {rows.map((job) => {
+        const outcome = automationOutcome(job);
+        const exported = (job.exportedClips || []).filter((clip) => clip.exportPath || clip.status === "exported").length;
+        return (
+          <div key={job.id} className={`automation-status-row ${outcome.className}`}>
+            <strong title={job.videoPath}>{automationVideoName(job)}</strong>
+            <span className={`automation-state ${outcome.className}`}>{outcome.label}</span>
+            <span>{job.candidates?.length || 0}</span>
+            <span>{job.acceptedClips?.length || 0}</span>
+            <span>{job.uploadDraftPath ? "投稿草稿" : exported ? `${exported} 个导出` : "-"}</span>
+            <em>{automationJobMessage(job)}</em>
+            <div className="automation-row-actions">
+              <button type="button" onClick={() => onOpen(job, "video")}>素材</button>
+              <button type="button" onClick={() => onOpen(job, "clips")} disabled={!job.acceptedClips?.length}>切片</button>
+              <button type="button" onClick={() => onOpen(job, "upload")} disabled={!job.uploadDraftPath}>投稿</button>
+              {onRequeue && (job.status === "error" || job.status === "ready") ? (
+                <button type="button" onClick={() => onRequeue(job)}>重跑</button>
+              ) : null}
+            </div>
+            <time>{job.updatedAt ? formatDate(job.updatedAt) : "-"}</time>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function AutomationJobCard({
+  job,
+  onOpen,
+  onRequeue
+}: {
+  job: AutomationJob;
+  onOpen: (job: AutomationJob, target: AutomationJobTarget) => void;
+  onRequeue?: (job: AutomationJob) => void;
+}) {
   const exported = job.exportedClips?.length || 0;
   const accepted = job.acceptedClips?.length || 0;
   const progress = automationProgress(job);
   const className = automationStatusClass(job);
   const highScore = Math.max(...(job.acceptedClips || []).map((clip) => Number(clip.automation?.score ?? clip.score ?? 0)), 0);
+  const filtered = String(job.stage || "").includes("no-high-confidence");
+  const stale = isAutomationJobStale(job);
+  const draftTitles = (job.acceptedClips || []).map((clip) => clip.title).filter(Boolean).slice(0, 3);
   return (
     <article className={`task-card automation-task ${className}`} data-testid={`automation-task-${job.id}`}>
       <div className="task-head">
@@ -1935,20 +2277,45 @@ function AutomationJobCard({ job }: { job: AutomationJob }) {
         </div>
         <em>{job.updatedAt ? formatDate(job.updatedAt) : ""}</em>
       </div>
-      <p>{job.message || automationStageLabel(job)}</p>
+      <p>{automationJobMessage(job)}</p>
       <div className="automation-strip compact">
         <span className="automation-pill">候选 {job.candidates?.length || 0}</span>
-        <span className="automation-pill ready">采纳 {accepted}</span>
+        <span className={`automation-pill ${accepted ? "draft" : "muted"}`}>切片草稿 {accepted}</span>
         <span className={`automation-pill ${exported ? "ready" : "muted"}`}>导出 {exported}</span>
+        {job.uploadDraftPath ? <span className="automation-pill draft">投稿草稿</span> : null}
+        {filtered ? <span className="automation-pill filtered">无高置信</span> : null}
+        {stale ? <span className="automation-pill stale">疑似卡住</span> : null}
         {highScore ? <span className="automation-pill">最高分 {highScore}</span> : null}
         <span className="automation-pill">{uploadPolicyLabel(job.uploadPolicy)}</span>
       </div>
+      {draftTitles.length ? (
+        <div className="draft-title-list">
+          {draftTitles.map((title) => <span key={title}>{title}</span>)}
+        </div>
+      ) : null}
       <div className="task-progress">
         <span style={{ width: `${Math.max(0, Math.min(100, progress))}%` }} />
       </div>
-      {job.uploadDraftPath ? <code data-testid={`automation-draft-${job.id}`}>{job.uploadDraftPath}</code> : null}
+      {accepted && job.projectPath ? <code data-testid={`automation-project-${job.id}`}>切片草稿：{job.projectPath}</code> : null}
+      {job.uploadDraftPath ? <code data-testid={`automation-draft-${job.id}`}>投稿草稿：{job.uploadDraftPath}</code> : null}
       {job.uploadJobId ? <code>投稿任务：{job.uploadJobId}</code> : null}
       {job.error ? <div className="preflight-box bad">{job.error}</div> : null}
+      <div className="card-actions">
+        <button type="button" onClick={() => onOpen(job, "video")}>
+          <Film size={15} />打开素材
+        </button>
+        <button type="button" onClick={() => onOpen(job, "clips")} disabled={!accepted}>
+          <Scissors size={15} />看切片
+        </button>
+        <button type="button" onClick={() => onOpen(job, "upload")} disabled={!job.uploadDraftPath}>
+          <Upload size={15} />投稿草稿
+        </button>
+        {onRequeue && (job.status === "error" || job.status === "ready" || isAutomationJobStale(job)) ? (
+          <button type="button" onClick={() => onRequeue(job)}>
+            重新分析
+          </button>
+        ) : null}
+      </div>
     </article>
   );
 }
@@ -2024,7 +2391,20 @@ function LibraryView({
         fixed: room,
         material: null
       }))
-  ];
+  ].filter((card) => {
+    const q = query.trim().toLowerCase();
+    if (!q) return true;
+    const hay = [
+      card.roomId,
+      card.material?.name,
+      card.material?.folderName,
+      card.fixed?.name,
+      card.fixed?.title,
+      card.fixed?.anchorName,
+      card.fixed?.areaName
+    ].filter(Boolean).join(" ").toLowerCase();
+    return hay.includes(q);
+  });
   const current = recordingSummary
     || fixedRooms.find((room) => ["recording", "completed", "error", "waiting", "starting"].includes(String(room.taskStatus)))
     || fixedRooms[0]
@@ -2157,8 +2537,8 @@ function LibraryView({
                     <Switch
                       checked={recordingEnabled}
                       dataTestId={`room-recording-toggle-${fixed.roomId}`}
-                      disabled={isRecordingBusy || activeRecording}
-                      label={recordingEnabled ? "自动录制" : "已关闭"}
+                      disabled={isRecordingBusy}
+                      label={recordingEnabled ? "监控录制" : "已关闭"}
                       onChange={(enabled) => onToggleRoomEnabled(fixed.roomId, enabled)}
                     />
                   ) : null}
@@ -2277,6 +2657,7 @@ function WorkspaceView(props: {
   onPreviewClip: (clip: Pick<ClipCandidate, "start" | "end">) => void;
   onAddClip: (candidate?: ClipCandidate) => void;
   onUpdateClip: (id: string, patch: Partial<ClipDraft>) => void;
+  onRemoveClip: (id: string) => void;
   onExportClip: (clip: ClipDraft) => void;
   onPackageClip: (clip: ClipDraft) => void;
   onExtractCover: (clip: ClipDraft) => void;
@@ -2327,6 +2708,7 @@ function WorkspaceView(props: {
     onPreviewClip,
     onAddClip,
     onUpdateClip,
+    onRemoveClip,
     onExportClip,
     onPackageClip,
     onExtractCover,
@@ -2438,6 +2820,10 @@ function WorkspaceView(props: {
           selection={{ start: selectionStart, end: selectionEnd }}
           candidates={candidates}
           onSeek={onSeek}
+          onSelectionChange={(start, end) => {
+            onSelectionStart(start);
+            onSelectionEnd(end);
+          }}
         />
 
         <div className="slice-controls">
@@ -2511,6 +2897,7 @@ function WorkspaceView(props: {
           disabled={isActiveRecording}
           onPreview={onPreviewClip}
           onUpdate={onUpdateClip}
+          onRemove={onRemoveClip}
           onExport={onExportClip}
           onPackage={onPackageClip}
           onCover={onExtractCover}
@@ -2731,6 +3118,7 @@ function ClipPanel({
   disabled,
   onPreview,
   onUpdate,
+  onRemove,
   onExport,
   onPackage,
   onCover,
@@ -2742,6 +3130,7 @@ function ClipPanel({
   disabled: boolean;
   onPreview: (clip: ClipDraft) => void;
   onUpdate: (id: string, patch: Partial<ClipDraft>) => void;
+  onRemove: (id: string) => void;
   onExport: (clip: ClipDraft) => void;
   onPackage: (clip: ClipDraft) => void;
   onCover: (clip: ClipDraft) => void;
@@ -2782,6 +3171,9 @@ function ClipPanel({
             <div className="card-actions">
               <button onClick={() => onPreview(clip)}>
                 <Play size={15} />预览
+              </button>
+              <button onClick={() => onRemove(clip.id)} disabled={disabled}>
+                删除
               </button>
               <button onClick={() => onExport(clip)} disabled={disabled || busy === `export-${clip.id}`}>
                 {busy === `export-${clip.id}` ? <Loader2 className="spin" size={15} /> : <Download size={15} />}
@@ -2895,7 +3287,7 @@ function SubtitleEditor({
         <Plus size={15} />新增字幕行
       </button>
       <div className="table-list">
-        {visible.length === 0 ? <EmptyMini label="当前视频没有字幕文件" /> : null}
+        {visible.length === 0 ? <EmptyMini label={cues.length ? "附近时间没有字幕，可滚动播放或搜索整段字幕" : "当前视频没有字幕文件"} /> : null}
         {visible.map((cue) => {
           const isCurrent = cue.start <= currentTime && cue.end >= currentTime;
           const isNear = !isCurrent && Math.abs(cue.start - currentTime) <= 5;
@@ -2919,6 +3311,8 @@ function UploadView({
   roomDetail,
   context,
   clips,
+  externalDraft,
+  onConsumeExternalDraft,
   onRefreshTools
 }: {
   tools: UploadTools | null;
@@ -2926,6 +3320,8 @@ function UploadView({
   roomDetail: RoomDetail | null;
   context: VideoContext | null;
   clips: ClipDraft[];
+  externalDraft?: { path: string; draft: UploadDraft; sourceJobId?: string } | null;
+  onConsumeExternalDraft?: () => void;
   onRefreshTools: () => Promise<void>;
 }) {
   const uploadScopeKey = roomDetail?.key || context?.key || "";
@@ -2950,6 +3346,7 @@ function UploadView({
   const [loadingArchiveVid, setLoadingArchiveVid] = useState<string | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyDetecting, setHistoryDetecting] = useState(false);
+  const [historyStatus, setHistoryStatus] = useState<"idle" | "ok" | "empty" | "error">("idle");
   const [preflight, setPreflight] = useState<UploadPreflight | null>(null);
   const [job, setJob] = useState<UploadJob | null>(null);
   const [busy, setBusy] = useState(false);
@@ -2967,6 +3364,20 @@ function UploadView({
   }, [uploadScopeKey, exportedClipKey]);
 
   useEffect(() => {
+    if (!externalDraft?.draft) return;
+    setDraft((prev) => ({
+      ...defaults,
+      ...prev,
+      ...externalDraft.draft,
+      parts: Array.isArray(externalDraft.draft.parts) && externalDraft.draft.parts.length
+        ? externalDraft.draft.parts
+        : prev.parts
+    }));
+    setLoginMessage(`已载入投稿草稿：${externalDraft.path}`);
+    onConsumeExternalDraft?.();
+  }, [externalDraft?.path, externalDraft?.sourceJobId]);
+
+  useEffect(() => {
     setHistoryItems([]);
     setRemoteArchive(null);
     setRemoteArchiveCache({});
@@ -2974,6 +3385,7 @@ function UploadView({
     setLoadingArchiveVid(null);
     setHistoryLoading(false);
     setHistoryDetecting(false);
+    setHistoryStatus("idle");
     autoHistoryKeyRef.current = "";
   }, [uploadScopeKey]);
 
@@ -3137,6 +3549,18 @@ function UploadView({
   }
 
   async function finalConfirmUpload() {
+    const partCount = (draft.parts || []).filter((part) => String(part.path || "").trim()).length;
+    const visibility = draft.visibility === "onlySelf" || draft.isOnlySelf ? "仅自己可见" : "公开";
+    const title = String(draft.title || "").trim() || "(无标题)";
+    const mode = draft.publishMode === "append" ? "追加分 P" : "新稿件投稿";
+    const ok = window.confirm(
+      `确认执行真实投稿？\n\n模式：${mode}\n标题：${title}\n可见范围：${visibility}\n分 P 数：${partCount}\n\n此操作会调用本地 biliup 上传到 B 站。`
+    );
+    if (!ok) return;
+    if (!preflight?.ok) {
+      const runAnyway = window.confirm("还没有通过预检，或预检结果已过期。仍要直接投稿吗？建议先点「预检」。");
+      if (!runAnyway) return;
+    }
     setBusy(true);
     try {
       const result = await runBiliupUpload({ ...draft, autoSubmit: true, cookiePath: draft.cookiePath || tools?.cookiePath });
@@ -3154,12 +3578,20 @@ function UploadView({
     setHistoryLoading(true);
     try {
       const result = await loadUploadHistory({ cookiePath: draft.cookiePath || tools?.cookiePath, maxPages: 1 });
+      if (result.ok === false) {
+        setHistoryStatus("error");
+        setHistoryItems([]);
+        setArchiveOutput(formatUploadReadFailure(result, "历史稿件读取失败"));
+        setLoginMessage(result.message || "Cookie 文件存在，但读取历史稿件失败。");
+        return;
+      }
       const archives = result.archives || [];
       setHistoryItems(archives);
+      setHistoryStatus(archives.length ? "ok" : "empty");
       setArchiveOutput(archives.length ? null : result.output || result.message || "");
       setLoginMessage(result.command || null);
       if (archives.length) {
-        void autoDetectHistoryParts(archives);
+        void autoDetectFirstHistoryArchive(archives);
       }
     } catch (err) {
       setArchiveOutput(readableError(err));
@@ -3205,7 +3637,7 @@ function UploadView({
         setRemoteArchiveCache((prev) => ({ ...prev, [targetVid]: nextArchive }));
         applyRemoteArchive(targetVid, nextArchive);
       } else {
-        setArchiveOutput(result.output || result.message || "");
+        setArchiveOutput(formatUploadReadFailure(result, "分 P 读取失败"));
       }
       setLoginMessage(result.command || null);
     } catch (err) {
@@ -3216,35 +3648,17 @@ function UploadView({
     }
   }
 
-  async function autoDetectHistoryParts(items: UploadHistoryItem[]) {
-    if (!items.length) return;
+  async function autoDetectFirstHistoryArchive(items: UploadHistoryItem[]) {
+    const target = draft.vid
+      ? items.find((item) => item.bvid === draft.vid) || items[0]
+      : items[0];
+    if (!target?.bvid) return;
     setHistoryDetecting(true);
-    let nextCache = remoteArchiveCache;
-    let selected = Boolean(remoteArchive?.archive.bvid);
     try {
-      for (const item of items) {
-        if (!item.bvid) continue;
-        let detail = nextCache[item.bvid];
-        if (!detail) {
-          setLoadingArchiveVid(item.bvid);
-          const result = await loadArchiveDetail({ cookiePath: draft.cookiePath || tools?.cookiePath, vid: item.bvid });
-          if (result.archive && result.videos) {
-            detail = { archive: result.archive, videos: result.videos };
-            nextCache = { ...nextCache, [item.bvid]: detail };
-            setRemoteArchiveCache(nextCache);
-          }
-        }
-        if (!selected && detail?.videos.length) {
-          applyRemoteArchive(item.bvid, detail);
-          selected = true;
-        }
-      }
-      setLoginMessage(selected ? "历史稿件分 P 已自动识别并展示。" : "历史稿件已识别，未发现可展示的历史分 P。");
-    } catch (err) {
-      setArchiveOutput(readableError(err));
+      await readArchiveByVid(target.bvid);
+      setLoginMessage("已读取当前目标稿件的历史分 P。");
     } finally {
       setHistoryDetecting(false);
-      setLoadingArchiveVid(null);
     }
   }
 
@@ -3253,7 +3667,7 @@ function UploadView({
       setArchiveOutput("请先读取历史稿件。");
       return;
     }
-    await autoDetectHistoryParts(historyItems);
+    await autoDetectFirstHistoryArchive(historyItems);
   }
 
   const historyDetectedCount = historyItems.filter((item) => remoteArchiveCache[item.bvid]).length;
@@ -3261,8 +3675,33 @@ function UploadView({
   const historyDetectionComplete = Boolean(historyItems.length) && historyDetectedCount >= historyItems.length;
   const showHistoryEmpty = historyDetectionComplete && !historyHasDetectedParts && !remoteArchive;
   const historyWorking = historyLoading || historyDetecting;
+  const pendingPartCount = draft.parts?.length || 0;
+  const historyStatusLabel = historyLoading
+    ? "读取中"
+    : historyDetecting
+      ? `${historyDetectedCount}/${historyItems.length}`
+      : !tools?.biliup
+        ? "未安装"
+        : !tools.cookieExists
+          ? "需登录"
+          : historyStatus === "error"
+            ? "读取失败"
+            : remoteArchive
+              ? `${remoteArchive.videos.length} 分 P`
+              : historyItems.length
+                ? `${historyItems.length} 稿件`
+                : "可读取";
   const uploadReadinessIssues = getUploadReadinessIssues(tools, draft);
   const canExecuteUpload = uploadReadinessIssues.length === 0;
+  const readyPartCount = (draft.parts || []).filter((part) => String(part.path || "").trim()).length;
+  const appendStartIndex = remoteArchive && draft.publishMode === "append" ? remoteArchive.videos.length + 1 : 1;
+  const primaryUploadLabel = draft.publishMode === "append"
+    ? readyPartCount
+      ? `追加投稿 P${appendStartIndex}${readyPartCount > 1 ? `-P${appendStartIndex + readyPartCount - 1}` : ""}`
+      : "追加投稿"
+    : readyPartCount > 1
+      ? `投稿 ${readyPartCount} 个分 P`
+      : "投稿";
   const executeLabel = !tools?.biliup
     ? "先安装 biliup"
     : !tools.cookieExists
@@ -3288,7 +3727,7 @@ function UploadView({
           </button>
         </div>
 
-        <div className="form-grid">
+        <div className="form-grid upload-mode-grid">
           <label>
             投稿方式
             <select value={draft.publishMode || "upload"} onChange={(event) => patch({ publishMode: event.target.value as UploadDraft["publishMode"] })}>
@@ -3303,87 +3742,161 @@ function UploadView({
               <option value="onlySelf">仅自己可见</option>
             </select>
           </label>
-          {draft.publishMode === "append" ? (
+        </div>
+
+        {draft.publishMode === "append" ? (
+          <div className="append-workbench">
+            <div className="append-target-head">
+              <div className="panel-title">
+                <ListVideo size={18} />
+                <h3>目标稿件与已有分 P</h3>
+                <span>{historyStatusLabel}</span>
+              </div>
+              <div className="card-actions">
+                <button onClick={readHistory} disabled={busy || historyWorking}>
+                  {historyLoading ? <Loader2 className="spin" size={15} /> : <ListVideo size={15} />}
+                  历史稿件
+                </button>
+                <button onClick={readArchive} disabled={busy || !draft.vid}>
+                  <RefreshCw size={15} />读取分 P
+                </button>
+              </div>
+            </div>
+            <div className="append-target-controls">
+              <label>
+                目标稿件 BV / av
+                <input value={draft.vid || ""} placeholder="例如 BV1xxp8z4EWa 或 av123" onChange={(event) => patch({ vid: event.target.value })} />
+              </label>
+            </div>
+            {historyItems.length ? (
+              <div className="archive-list inline">
+                {historyItems.map((item) => (
+                  <HistoryArchiveItem
+                    key={item.bvid}
+                    item={item}
+                    detail={remoteArchiveCache[item.bvid]}
+                    active={remoteArchive?.archive.bvid === item.bvid}
+                    loading={loadingArchiveVid === item.bvid}
+                    pendingCount={pendingPartCount}
+                    onOpen={() => void readArchiveByVid(item.bvid)}
+                  />
+                ))}
+              </div>
+            ) : null}
+            {archiveOutput ? <pre className="command-box">{archiveOutput}</pre> : null}
+            {remoteArchive ? (
+              <RemoteArchiveParts archive={remoteArchive.archive} parts={remoteArchive.videos} />
+            ) : historyLoading ? (
+              <RemoteArchiveStatus title="正在读取历史稿件" message="已检测到 Cookie，正在从 B 站读取历史稿件。" />
+            ) : historyDetecting ? (
+              <RemoteArchiveStatus title="正在读取目标分 P" message={`正在读取 ${draft.vid || "目标稿件"} 的已有分 P。`} />
+            ) : showHistoryEmpty ? (
+              <RemoteArchiveStatus title="未发现历史分 P" message="当前历史稿件没有可展示的分 P。" />
+            ) : (
+              <RemoteArchiveStatus title="选择目标稿件" message="读取历史稿件或输入 BV 号后，会在这里显示 B 站已有分 P。" />
+            )}
+          </div>
+        ) : null}
+
+        <details className="upload-advanced-fields" open={draft.publishMode !== "append"}>
+          <summary>{draft.publishMode === "append" ? "高级投稿参数" : "稿件信息"}</summary>
+          <div className="form-grid">
             <label className="span-2">
-              目标稿件 BV / av
-              <input value={draft.vid || ""} placeholder="例如 BV1xxp8z4EWa 或 av123" onChange={(event) => patch({ vid: event.target.value })} />
+              标题
+              <input value={draft.title || ""} maxLength={80} onChange={(event) => patch({ title: event.target.value })} />
             </label>
-          ) : null}
-          <label className="span-2">
-            标题
-            <input value={draft.title || ""} maxLength={80} onChange={(event) => patch({ title: event.target.value })} />
-          </label>
-          <label>
-            分区 tid
-            <input type="number" value={draft.tid || 0} onChange={(event) => patch({ tid: Number(event.target.value) })} />
-          </label>
-          <label>
-            投稿线路
-            <select value={draft.line || "auto"} onChange={(event) => patch({ line: event.target.value })}>
-              <option value="auto">auto</option>
-              <option value="bda2">bda2</option>
-              <option value="qn">qn</option>
-              <option value="tx">tx</option>
-              <option value="ws">ws</option>
-            </select>
-          </label>
-          <label>
-            版权
-            <select value={draft.copyright || 1} onChange={(event) => patch({ copyright: Number(event.target.value) })}>
-              <option value={1}>自制</option>
-              <option value={2}>转载</option>
-            </select>
-          </label>
-          <label>
-            来源
-            <input value={draft.source || ""} onChange={(event) => patch({ source: event.target.value })} />
-          </label>
-          <label className="span-2">
-            标签
-            <input value={draft.tag || ""} onChange={(event) => patch({ tag: event.target.value })} />
-          </label>
-          <label className="span-2">
-            简介
-            <textarea value={draft.desc || ""} onChange={(event) => patch({ desc: event.target.value })} />
-          </label>
-          <label>
-            动态
-            <input value={draft.dynamic || ""} onChange={(event) => patch({ dynamic: event.target.value })} />
-          </label>
-          <label>
-            定时发布
-            <input type="datetime-local" value={draft.dtime || ""} onChange={(event) => patch({ dtime: event.target.value })} />
-          </label>
-          <label className="span-2">
-            封面
-            <input value={draft.cover || ""} onChange={(event) => patch({ cover: event.target.value })} />
-          </label>
-          <label className="span-2">
-            Cookie 文件
-            <input value={draft.cookiePath || tools?.cookiePath || ""} onChange={(event) => patch({ cookiePath: event.target.value })} />
-          </label>
-        </div>
+            <label>
+              分区 tid
+              <input type="number" value={draft.tid || 0} onChange={(event) => patch({ tid: Number(event.target.value) })} />
+            </label>
+            <label>
+              投稿线路
+              <select value={draft.line || "auto"} onChange={(event) => patch({ line: event.target.value })}>
+                <option value="auto">auto</option>
+                <option value="bda2">bda2</option>
+                <option value="qn">qn</option>
+                <option value="tx">tx</option>
+                <option value="ws">ws</option>
+              </select>
+            </label>
+            <label>
+              版权
+              <select value={draft.copyright || 1} onChange={(event) => patch({ copyright: Number(event.target.value) })}>
+                <option value={1}>自制</option>
+                <option value={2}>转载</option>
+              </select>
+            </label>
+            <label>
+              来源
+              <input value={draft.source || ""} onChange={(event) => patch({ source: event.target.value })} />
+            </label>
+            <label className="span-2">
+              标签
+              <input value={draft.tag || ""} onChange={(event) => patch({ tag: event.target.value })} />
+            </label>
+            <label className="span-2">
+              简介
+              <textarea value={draft.desc || ""} onChange={(event) => patch({ desc: event.target.value })} />
+            </label>
+            <label>
+              动态
+              <input value={draft.dynamic || ""} onChange={(event) => patch({ dynamic: event.target.value })} />
+            </label>
+            <label>
+              定时发布
+              <input type="datetime-local" value={draft.dtime || ""} onChange={(event) => patch({ dtime: event.target.value })} />
+            </label>
+            <label className="span-2">
+              封面
+              <input value={draft.cover || ""} onChange={(event) => patch({ cover: event.target.value })} />
+            </label>
+            <label className="span-2">
+              投稿 Cookie 文件
+              <input value={draft.cookiePath || tools?.cookiePath || ""} onChange={(event) => patch({ cookiePath: event.target.value })} />
+              <small className="field-help">
+                当前来源：{tools?.cookieSource || "未检测"}。投稿登录与录制 Cookie 可共用文件；扫码登录会写到这里用于 biliup。
+              </small>
+            </label>
+          </div>
+          <div className="switch-grid">
+            <Switch checked={Boolean(draft.noReprint)} label="禁止转载" onChange={(value) => patch({ noReprint: value ? 1 : 0 })} />
+            <Switch checked={Boolean(draft.openElec)} label="充电入口" onChange={(value) => patch({ openElec: value ? 1 : 0 })} />
+            <Switch checked={Boolean(draft.dolby)} label="杜比音效" onChange={(value) => patch({ dolby: value ? 1 : 0 })} />
+            <Switch checked={Boolean(draft.hires)} label="Hi-Res" onChange={(value) => patch({ hires: value ? 1 : 0 })} />
+            <Switch checked={Boolean(draft.subtitleOpen)} label="开启字幕" onChange={(value) => patch({ subtitleOpen: value ? 1 : 0 })} />
+            <Switch checked={Boolean(draft.upCloseDanmu)} label="关闭弹幕" onChange={(value) => patch({ upCloseDanmu: value })} />
+            <Switch checked={Boolean(draft.upCloseReply)} label="关闭评论" onChange={(value) => patch({ upCloseReply: value })} />
+            <Switch checked={Boolean(draft.upSelectionReply)} label="精选评论" onChange={(value) => patch({ upSelectionReply: value })} />
+          </div>
+        </details>
 
-        <div className="switch-grid">
-          <Switch checked={Boolean(draft.noReprint)} label="禁止转载" onChange={(value) => patch({ noReprint: value ? 1 : 0 })} />
-          <Switch checked={Boolean(draft.openElec)} label="充电入口" onChange={(value) => patch({ openElec: value ? 1 : 0 })} />
-          <Switch checked={Boolean(draft.dolby)} label="杜比音效" onChange={(value) => patch({ dolby: value ? 1 : 0 })} />
-          <Switch checked={Boolean(draft.hires)} label="Hi-Res" onChange={(value) => patch({ hires: value ? 1 : 0 })} />
-          <Switch checked={Boolean(draft.subtitleOpen)} label="开启字幕" onChange={(value) => patch({ subtitleOpen: value ? 1 : 0 })} />
-          <Switch checked={Boolean(draft.upCloseDanmu)} label="关闭弹幕" onChange={(value) => patch({ upCloseDanmu: value })} />
-          <Switch checked={Boolean(draft.upCloseReply)} label="关闭评论" onChange={(value) => patch({ upCloseReply: value })} />
-          <Switch checked={Boolean(draft.upSelectionReply)} label="精选评论" onChange={(value) => patch({ upSelectionReply: value })} />
-        </div>
-
-        {remoteArchive ? (
+        {draft.publishMode !== "append" && remoteArchive ? (
           <RemoteArchiveParts archive={remoteArchive.archive} parts={remoteArchive.videos} />
-        ) : historyLoading ? (
+        ) : draft.publishMode !== "append" && historyLoading ? (
           <RemoteArchiveStatus title="正在读取历史稿件" message="已检测到 Cookie，正在从 B 站读取历史稿件并识别分 P。" />
-        ) : historyDetecting ? (
+        ) : draft.publishMode !== "append" && historyDetecting ? (
           <RemoteArchiveStatus title="正在识别历史分 P" message={`已识别 ${historyDetectedCount}/${historyItems.length} 个历史稿件。`} />
-        ) : showHistoryEmpty ? (
+        ) : draft.publishMode !== "append" && showHistoryEmpty ? (
           <RemoteArchiveStatus title="未发现历史分 P" message="当前历史稿件没有可展示的分 P，可以继续作为新稿件投稿。" />
         ) : null}
+
+        {remoteArchive && draft.publishMode === "append" ? (
+          <AppendTargetSummary archive={remoteArchive.archive} existingCount={remoteArchive.videos.length} pendingCount={pendingPartCount} />
+        ) : null}
+
+        <UploadFlowActions
+          busy={busy}
+          canExecute={canExecuteUpload}
+          commandPreview={commandPreview}
+          isAppend={draft.publishMode === "append"}
+          issues={uploadReadinessIssues}
+          label={primaryUploadLabel}
+          onExecute={finalConfirmUpload}
+          onPreflight={runPreflight}
+          preflight={preflight}
+          readyPartCount={readyPartCount}
+          targetVid={draft.vid || remoteArchive?.archive.bvid || ""}
+        />
 
         <div className="part-manager">
           <div className="part-manager-head">
@@ -3454,10 +3967,27 @@ function UploadView({
             <h3>登录</h3>
             <span>{tools?.biliup ? tools.biliupSource === "workspace" ? "本地可用" : "系统可用" : "未安装"}</span>
           </div>
-          <div className="qr-box">
+          <div className={`qr-box ${tools?.cookieExists ? historyStatus === "error" ? "warn" : "ready" : tools?.biliup ? "warn" : "blocked"}`}>
             <Sparkles size={40} />
-            <span>{tools?.cookieExists ? "Cookie 已存在" : tools?.biliup ? "还差扫码登录" : "先安装投稿工具"}</span>
+            <span>{tools?.cookieExists ? "Cookie 文件已找到" : tools?.biliup ? "还差扫码登录" : "先安装投稿工具"}</span>
+            {tools?.cookieExists && historyStatus === "error" ? <small>文件存在，但读取稿件失败</small> : null}
           </div>
+          {tools ? (
+            <div className="cookie-status-list">
+              <span>
+                <strong>文件</strong>
+                {tools.cookieExists ? "已找到" : "未找到"}
+              </span>
+              <span>
+                <strong>来源</strong>
+                {tools.cookieSource || "默认路径"}
+              </span>
+              <span>
+                <strong>稿件读取</strong>
+                {historyStatus === "error" ? "失败，建议重新扫码" : tools.cookieExists ? "可检查" : "等待登录"}
+              </span>
+            </div>
+          ) : null}
           {!tools?.biliup ? (
             <button className="wide" onClick={installLocalBiliup} disabled={busy || job?.status === "running"}>
               {job?.type === "install-biliup" && job.status === "running" ? <Loader2 className="spin" size={16} /> : <Download size={16} />}
@@ -3481,7 +4011,7 @@ function UploadView({
           <div className="panel-title">
             <Settings2 size={18} />
             <h3>biliup 能力</h3>
-            <span>{tools?.biliupVersion || `已测 ${tools?.testedBiliupVersion || "1.1.29"}`}</span>
+            <span>{tools?.biliupVersion || `已测 ${tools?.testedBiliupVersion || "1.2.1"}`}</span>
           </div>
           <div className="capability-list">
             <span>多文件新稿件分 P</span>
@@ -3505,11 +4035,12 @@ function UploadView({
           {commandPreview ? <pre className="command-box">{commandPreview}</pre> : null}
         </div>
 
+        {draft.publishMode !== "append" ? (
         <div className="panel">
           <div className="panel-title">
             <ListVideo size={18} />
             <h3>稿件管理</h3>
-            <span>{historyLoading ? "读取中" : historyDetecting ? `${historyDetectedCount}/${historyItems.length}` : "需 cookie"}</span>
+            <span>{historyStatusLabel}</span>
           </div>
           <div className="card-actions">
             <button onClick={readHistory} disabled={busy || historyWorking}>{historyLoading ? "读取中" : historyDetecting ? "识别中" : "历史稿件"}</button>
@@ -3525,6 +4056,7 @@ function UploadView({
                   detail={remoteArchiveCache[item.bvid]}
                   active={remoteArchive?.archive.bvid === item.bvid}
                   loading={loadingArchiveVid === item.bvid}
+                  pendingCount={pendingPartCount}
                   onOpen={() => void readArchiveByVid(item.bvid)}
                 />
               ))}
@@ -3532,6 +4064,7 @@ function UploadView({
           ) : null}
           {archiveOutput ? <pre className="command-box">{archiveOutput}</pre> : null}
         </div>
+        ) : null}
 
         <div className="panel">
           <div className="panel-title">
@@ -3560,15 +4093,29 @@ function HistoryArchiveItem({
   detail,
   active,
   loading,
+  pendingCount,
   onOpen
 }: {
   item: UploadHistoryItem;
   detail?: { archive: RemoteArchiveInfo; videos: RemoteArchivePart[] };
   active: boolean;
   loading: boolean;
+  pendingCount: number;
   onOpen: () => void;
 }) {
-  const partLabel = loading ? "识别中" : detail ? detail.videos.length ? `${detail.videos.length} 分 P` : "无分 P" : "待识别";
+  const listedPartCount = Number(item.partCount || 0);
+  const partLabel = loading
+    ? "识别中"
+    : detail
+      ? detail.videos.length ? `${detail.videos.length} 分 P` : "无分 P"
+      : listedPartCount
+        ? `${listedPartCount} 分 P`
+        : "待识别";
+  const nextPartLabel = detail?.videos.length && pendingCount
+    ? `待追加 P${detail.videos.length + 1}${pendingCount > 1 ? `-P${detail.videos.length + pendingCount}` : ""}`
+    : pendingCount
+      ? `待追加 ${pendingCount} 个`
+      : "分 P 队列为空";
   return (
     <div className={`archive-item ${active ? "active" : ""}`}>
       <button onClick={onOpen}>
@@ -3576,6 +4123,7 @@ function HistoryArchiveItem({
         <span>{item.title || "未命名稿件"}</span>
         {item.status ? <small>{item.status}</small> : null}
         <em>{partLabel}</em>
+        <small className="archive-item-append">{active ? "当前目标稿件" : "追加到这个稿件"} · {nextPartLabel}</small>
       </button>
     </div>
   );
@@ -3648,6 +4196,90 @@ function RemoteArchiveParts({ archive, parts }: { archive: RemoteArchiveInfo; pa
   );
 }
 
+function AppendTargetSummary({ archive, existingCount, pendingCount }: { archive: RemoteArchiveInfo; existingCount: number; pendingCount: number }) {
+  const start = existingCount + 1;
+  const end = existingCount + pendingCount;
+  const pendingLabel = pendingCount ? `P${start}${pendingCount > 1 ? `-P${end}` : ""}` : "还没有待追加分 P";
+  return (
+    <div className="append-target-summary">
+      <div>
+        <strong>已选目标稿件</strong>
+        <span>{archive.bvid}{archive.title ? ` · ${archive.title}` : ""}</span>
+      </div>
+      <div>
+        <strong>B 站已有</strong>
+        <span>{existingCount} 个分 P</span>
+      </div>
+      <div>
+        <strong>本地将追加</strong>
+        <span>{pendingLabel}</span>
+      </div>
+    </div>
+  );
+}
+
+function UploadFlowActions({
+  busy,
+  canExecute,
+  commandPreview,
+  isAppend,
+  issues,
+  label,
+  onExecute,
+  onPreflight,
+  preflight,
+  readyPartCount,
+  targetVid
+}: {
+  busy: boolean;
+  canExecute: boolean;
+  commandPreview: string | null;
+  isAppend: boolean;
+  issues: string[];
+  label: string;
+  onExecute: () => Promise<void>;
+  onPreflight: () => Promise<void>;
+  preflight: UploadPreflight | null;
+  readyPartCount: number;
+  targetVid: string;
+}) {
+  const status = issues.length
+    ? issues[0]
+    : preflight?.ok
+      ? "预检通过"
+      : commandPreview
+        ? "命令已生成"
+        : isAppend
+          ? `${targetVid || "目标稿件"} · ${readyPartCount} 个待追加分 P`
+          : `${readyPartCount} 个待投稿分 P`;
+  return (
+    <div className={`upload-flow-actions ${issues.length ? "blocked" : preflight?.ok ? "ready" : ""}`}>
+      <div className="upload-flow-state">
+        <strong>{isAppend ? "追加分 P 投稿" : "新稿件投稿"}</strong>
+        <span>{status}</span>
+      </div>
+      <div className="upload-flow-buttons">
+        <button onClick={onPreflight} disabled={busy}>
+          {busy ? <Loader2 className="spin" size={16} /> : <BadgeCheck size={16} />}
+          预检
+        </button>
+        <button className="primary" data-testid="upload-main-final-confirm" onClick={onExecute} disabled={busy || !canExecute} title={issues[0] || label}>
+          {busy ? <Loader2 className="spin" size={16} /> : <Send size={16} />}
+          {label}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function formatUploadReadFailure(result: { message?: string; output?: string; command?: string; exitCode?: number | string | null }, fallback: string) {
+  const lines = [result.message || fallback];
+  if (result.exitCode !== undefined && result.exitCode !== null) lines.push(`退出码：${result.exitCode}`);
+  if (result.command) lines.push(`命令：${result.command}`);
+  if (result.output) lines.push(result.output);
+  return lines.filter(Boolean).join("\n");
+}
+
 function buildInitialUploadParts(context: VideoContext | null, clips: ClipDraft[], roomDetail: RoomDetail | null): UploadPart[] {
   const exported = clips
     .filter((clip) => clip.exportPath)
@@ -3658,17 +4290,18 @@ function buildInitialUploadParts(context: VideoContext | null, clips: ClipDraft[
       source: "clip"
     }));
   if (exported.length) return exported;
-  const roomParts = buildRoomUploadParts(roomDetail, context);
-  if (roomParts.length) return roomParts;
-  if (!context) return [];
-  return [
-    {
-      id: `source-${context.key}`,
-      title: partTitleFromPath(context.name),
-      path: context.path,
-      source: "source"
-    }
-  ];
+  // Prefer the currently open video only; never auto-queue the whole room.
+  if (context) {
+    return [
+      {
+        id: `source-${context.key}`,
+        title: partTitleFromPath(context.name),
+        path: context.path,
+        source: "source"
+      }
+    ];
+  }
+  return [];
 }
 
 function buildRoomUploadParts(roomDetail: RoomDetail | null, context: VideoContext | null): UploadPart[] {
@@ -3774,6 +4407,8 @@ function getUploadReadinessIssues(tools: UploadTools | null, draft: UploadDraft)
   if (tools?.biliup && !tools.cookieExists) issues.push("扫码登录生成 Cookie。");
   if (!(draft.parts || []).some((part) => String(part.path || "").trim())) issues.push("添加至少一个本地视频分 P。");
   if (draft.publishMode === "append" && !String(draft.vid || "").trim()) issues.push("填写要追加的目标 BV 或 av 号。");
+  if (draft.publishMode !== "append" && !String(draft.title || "").trim()) issues.push("填写投稿标题。");
+  if (draft.publishMode !== "append" && !String(draft.tag || "").trim()) issues.push("填写至少一个标签。");
   return issues;
 }
 
@@ -3799,12 +4434,13 @@ function automationDisplayPriority(job: AutomationJob) {
   const stage = String(job.stage || "");
   const hasExport = Boolean(job.uploadDraftPath || job.exportedClips?.length || (job.acceptedClips || []).some((clip) => clip.exportPath));
   const hasAccepted = Boolean(job.acceptedClips?.length);
+  if (isAutomationJobStale(job)) return 3;
   if (job.status === "running" || job.status === "queued") return 0;
   if (hasExport) return 1;
   if (hasAccepted) return 2;
-  if (job.status === "error" || stage.includes("blocked")) return 3;
-  if (stage.includes("no-high-confidence")) return 5;
-  return 4;
+  if (job.status === "error" || stage.includes("blocked")) return 4;
+  if (stage.includes("no-high-confidence")) return 6;
+  return 5;
 }
 
 function sortAutomationJobsForDisplay(jobs: AutomationJob[]) {
@@ -3815,7 +4451,19 @@ function sortAutomationJobsForDisplay(jobs: AutomationJob[]) {
   });
 }
 
-function TaskCenterView({ automationJobs }: { automationJobs: AutomationJob[] }) {
+function TaskCenterView({
+  automationJobs,
+  busy,
+  onAnalyzeAll,
+  onOpenAutomationJob,
+  onRequeueAutomationJob
+}: {
+  automationJobs: AutomationJob[];
+  busy: string | null;
+  onAnalyzeAll: () => void;
+  onOpenAutomationJob: (job: AutomationJob, target: AutomationJobTarget) => void;
+  onRequeueAutomationJob: (job: AutomationJob) => void;
+}) {
   const [tasks, setTasks] = useState<WorkbenchTask[]>([]);
   const [error, setError] = useState<string | null>(null);
 
@@ -3844,7 +4492,7 @@ function TaskCenterView({ automationJobs }: { automationJobs: AutomationJob[] })
   const waitingRecording = tasks.filter(isWaitingRecordingTask).length;
   const failed = tasks.filter((task) => task.status === "error").length;
   const automationSummary = summarizeAutomationJobs(automationJobs);
-  const visibleAutomationJobs = sortAutomationJobsForDisplay(automationJobs).slice(0, 8);
+  const visibleAutomationJobs = sortAutomationJobsForDisplay(automationJobs).slice(0, 12);
 
   return (
     <div className="tasks-layout">
@@ -3867,10 +4515,15 @@ function TaskCenterView({ automationJobs }: { automationJobs: AutomationJob[] })
             <Scissors size={18} />
             <h3>自动切片</h3>
             <span>{automationSummary.total}</span>
+            <button className="primary" data-testid="automation-analyze-all" onClick={onAnalyzeAll} disabled={busy === "automation-all"}>
+              {busy === "automation-all" ? <Loader2 className="spin" size={15} /> : <Sparkles size={15} />}
+              AI 切片全部
+            </button>
           </div>
           <AutomationSummaryStrip summary={automationSummary} />
+          <AutomationJobsTable jobs={automationJobs} onOpen={onOpenAutomationJob} onRequeue={onRequeueAutomationJob} />
           <div className="task-grid automation-task-grid">
-            {visibleAutomationJobs.map((job) => <AutomationJobCard key={job.id} job={job} />)}
+            {visibleAutomationJobs.map((job) => <AutomationJobCard key={job.id} job={job} onOpen={onOpenAutomationJob} onRequeue={onRequeueAutomationJob} />)}
             {!automationJobs.length ? <EmptyMini label="还没有自动切片任务；录制完成或手动分析后会出现在这里。" /> : null}
           </div>
         </section>
@@ -4329,9 +4982,20 @@ function SettingsView({
             <div className="panel-title">
               <Wand2 size={18} />
               <h3>批量转码</h3>
-              <span>FLV 转 MP4</span>
+              <span>FLV 转 MP4 · 批量</span>
             </div>
             <p className="helper-text">这个是录制素材批量整理，不是浏览器预览。转换后素材库会优先展示同名 MP4。</p>
+            <div className="preset-grid media-presets" data-testid="media-presets">
+              <button type="button" className="preset-button" onClick={() => setValue((prev) => ({ ...prev, media: { ...prev.media, flvOutputMode: "same-dir", deleteSourceAfterConvert: false, skipIfMp4Exists: true, videoTranscodeMode: "copy", videoEncoder: "auto", audioTranscodeMode: "copy", convertConcurrency: 2 } }))}>
+                <span><strong>稳剪快速</strong><em>copy 转封装 · 并发 2</em></span>
+              </button>
+              <button type="button" className="preset-button" onClick={() => setValue((prev) => ({ ...prev, media: { ...prev.media, flvOutputMode: "same-dir", deleteSourceAfterConvert: false, skipIfMp4Exists: true, videoTranscodeMode: "copy", videoEncoder: "auto", audioTranscodeMode: "copy", convertConcurrency: 1 } }))}>
+                <span><strong>均衡</strong><em>copy · 并发 1</em></span>
+              </button>
+              <button type="button" className="preset-button" onClick={() => setValue((prev) => ({ ...prev, media: { ...prev.media, flvOutputMode: "compressed-dir", deleteSourceAfterConvert: false, skipIfMp4Exists: true, videoTranscodeMode: "compress", videoEncoder: "auto", videoCrf: 23, videoPreset: "veryfast", audioTranscodeMode: "aac", audioBitrateKbps: 160, convertConcurrency: 1 } }))}>
+                <span><strong>归档压缩</strong><em>H.264 · 可走 NVENC</em></span>
+              </button>
+            </div>
             <label>
               输出位置
               <select value={value.media.flvOutputMode} onChange={(event) => patch("media", { flvOutputMode: event.target.value })}>
@@ -4342,14 +5006,24 @@ function SettingsView({
             <label>
               视频处理
               <select value={value.media.videoTranscodeMode} onChange={(event) => patch("media", { videoTranscodeMode: event.target.value })}>
+                <option value="copy">只转封装（推荐，快）</option>
                 <option value="compress">压缩为 H.264</option>
-                <option value="copy">只转封装，不压视频</option>
               </select>
             </label>
             {value.media.videoTranscodeMode !== "copy" ? (
               <div className="form-grid">
                 <label>
-                  视频 CRF
+                  编码器
+                  <select value={value.media.videoEncoder || "auto"} onChange={(event) => patch("media", { videoEncoder: event.target.value })}>
+                    <option value="auto">自动（优先 NVIDIA/QSV/AMF）</option>
+                    <option value="nvenc">NVIDIA NVENC</option>
+                    <option value="qsv">Intel QSV</option>
+                    <option value="amf">AMD AMF</option>
+                    <option value="libx264">CPU libx264</option>
+                  </select>
+                </label>
+                <label>
+                  视频 CRF/CQ
                   <input type="number" min={0} max={51} value={value.media.videoCrf} onChange={(event) => patch("media", { videoCrf: Number(event.target.value) })} />
                 </label>
                 <label>
@@ -4365,11 +5039,16 @@ function SettingsView({
               </div>
             ) : null}
             <label>
+              转换并发
+              <input type="number" min={1} max={4} value={value.media.convertConcurrency || 1} onChange={(event) => patch("media", { convertConcurrency: Number(event.target.value) })} />
+              <small className="field-help">1 最稳；2 适合 SSD + 多核/显卡。过高可能把磁盘和编码器打满。</small>
+            </label>
+            <label>
               音频处理
               <select value={value.media.audioTranscodeMode} onChange={(event) => patch("media", { audioTranscodeMode: event.target.value })}>
+                <option value="copy">保留原音频（推荐）</option>
                 <option value="aac">压缩 AAC</option>
                 <option value="lossless">无损 ALAC</option>
-                <option value="copy">保留原音频</option>
               </select>
             </label>
             {value.media.audioTranscodeMode === "aac" ? (
@@ -4565,8 +5244,9 @@ function SettingsView({
                     <input value={value.recording.biliWebApiBase || ""} onChange={(event) => patch("recording", { biliWebApiBase: event.target.value })} />
                   </label>
                   <label className="span-2">
-                    Cookie 文件
+                    录制 Cookie（弹幕鉴权/高画质，可选）
                     <input value={value.recording.cookiePath || ""} onChange={(event) => patch("recording", { cookiePath: event.target.value })} placeholder=".workbench/drafts/cookies.json" />
+                    <small className="field-help">只给直播录制和弹幕用。投稿登录请到「投稿」页扫码，两边可以共用同一文件，但职责不同。</small>
                   </label>
                   <label>
                     接口超时（秒）
@@ -4614,11 +5294,29 @@ function SettingsView({
                       <option value="recording-cover">录制封面</option>
                     </select>
                   </label>
+                  <label>
+                    短录制阈值（秒）
+                    <input type="number" min={0} max={3600} value={value.recording.shortRecordingMinSeconds} onChange={(event) => patch("recording", { shortRecordingMinSeconds: Number(event.target.value) })} />
+                  </label>
+                  <label className="span-2">
+                    短录制归档目录
+                    <input value={value.recording.shortRecordingArchiveDir} onChange={(event) => patch("recording", { shortRecordingArchiveDir: event.target.value })} />
+                  </label>
+                  <label>
+                    断流合并窗口（秒）
+                    <input type="number" min={0} max={3600} value={value.recording.reconnectMergeWindowSeconds} onChange={(event) => patch("recording", { reconnectMergeWindowSeconds: Number(event.target.value) })} />
+                  </label>
+                  <label className="span-2">
+                    合并分段归档目录
+                    <input value={value.recording.mergedSegmentArchiveDir} onChange={(event) => patch("recording", { mergedSegmentArchiveDir: event.target.value })} />
+                  </label>
                 </div>
                 <div className="switch-grid tight">
                   <Switch checked={value.recording.saveCover} label="保存直播封面" onChange={(checked) => patch("recording", { saveCover: checked })} />
-                  <Switch checked={value.recording.remuxToMp4} label="录完转封装 MP4" onChange={(checked) => patch("recording", { remuxToMp4: checked })} />
+                  <Switch checked={value.recording.remuxToMp4} label="录制后转封装 MP4（copy，快）" onChange={(checked) => patch("recording", { remuxToMp4: checked })} />
                   <Switch checked={value.recording.deleteSourceAfterRemux !== "never"} label="FLV 转 MP4 后删除 FLV" onChange={(checked) => patch("recording", { deleteSourceAfterRemux: checked ? "always" : "never" })} />
+                  <Switch checked={value.recording.mergeReconnectSegments !== false} label="断流片段自动合并" onChange={(checked) => patch("recording", { mergeReconnectSegments: checked })} />
+                  <Switch checked={value.recording.shortRecordingCleanupEnabled} label="短录制自动归档" onChange={(checked) => patch("recording", { shortRecordingCleanupEnabled: checked })} />
                   <Switch checked={value.recording.injectExtraMetadata} label="写入关键帧/元数据" onChange={(checked) => patch("recording", { injectExtraMetadata: checked })} />
                   <Switch checked={value.recording.enableWebhooks} label="发送兼容 webhook 事件" onChange={(checked) => patch("recording", { enableWebhooks: checked })} />
                 </div>
@@ -4701,6 +5399,12 @@ function defaultServiceSettings(): ServiceSettings {
       remuxToMp4: true,
       injectExtraMetadata: true,
       deleteSourceAfterRemux: "always",
+      mergeReconnectSegments: true,
+      reconnectMergeWindowSeconds: 120,
+      mergedSegmentArchiveDir: ".workbench\\merged-segments",
+      shortRecordingCleanupEnabled: false,
+      shortRecordingMinSeconds: 60,
+      shortRecordingArchiveDir: ".workbench\\short-recordings",
       spaceCheckIntervalSeconds: 60,
       spaceThresholdMb: 1024,
       recycleRecords: false
@@ -4749,11 +5453,13 @@ function defaultServiceSettings(): ServiceSettings {
       flvOutputMode: "same-dir",
       deleteSourceAfterConvert: false,
       skipIfMp4Exists: true,
-      videoTranscodeMode: "compress",
+      videoTranscodeMode: "copy",
+      videoEncoder: "auto",
       videoCrf: 23,
       videoPreset: "veryfast",
-      audioTranscodeMode: "aac",
-      audioBitrateKbps: 160
+      audioTranscodeMode: "copy",
+      audioBitrateKbps: 160,
+      convertConcurrency: 2
     },
     automation: {
       enabled: false,
@@ -4764,7 +5470,7 @@ function defaultServiceSettings(): ServiceSettings {
       uploadPolicy: "review",
       clipDuration: 90,
       clipCount: 3,
-      sources: ["danmaku", "subtitle"],
+      sources: ["danmaku"],
       minScore: 72,
       minEvidenceCount: 2,
       requireHighConfidence: true,
@@ -4843,7 +5549,8 @@ function Timeline({
   currentTime,
   selection,
   candidates,
-  onSeek
+  onSeek,
+  onSelectionChange
 }: {
   bins: HistogramBin[];
   duration: number;
@@ -4851,22 +5558,113 @@ function Timeline({
   selection: { start: number; end: number };
   candidates: ClipCandidate[];
   onSeek: (time: number) => void;
+  onSelectionChange?: (start: number, end: number) => void;
 }) {
   const width = 1100;
   const height = 120;
   const safeDuration = Math.max(1, duration);
+  const dragRef = useRef<null | { mode: "move" | "start" | "end" | "create"; originX: number; originStart: number; originEnd: number }>(null);
+  const svgRef = useRef<SVGSVGElement | null>(null);
+
+  function timeFromClientX(clientX: number) {
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0) return 0;
+    const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+    return ratio * safeDuration;
+  }
+
+  function commitSelection(start: number, end: number) {
+    const a = Math.max(0, Math.min(safeDuration, Math.min(start, end)));
+    const b = Math.max(0, Math.min(safeDuration, Math.max(start, end)));
+    onSelectionChange?.(roundTime(a), roundTime(Math.max(a + 0.1, b)));
+  }
+
+  function onPointerDown(event: ReactPointerEvent<SVGSVGElement>) {
+    if (!onSelectionChange) {
+      onSeek(timeFromClientX(event.clientX));
+      return;
+    }
+    const t = timeFromClientX(event.clientX);
+    const handlePx = 10;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const x = ((t / safeDuration) * rect.width);
+    const startX = (selection.start / safeDuration) * rect.width;
+    const endX = (selection.end / safeDuration) * rect.width;
+    let mode: "move" | "start" | "end" | "create" = "create";
+    if (Math.abs(x - startX) <= handlePx) mode = "start";
+    else if (Math.abs(x - endX) <= handlePx) mode = "end";
+    else if (x >= Math.min(startX, endX) && x <= Math.max(startX, endX)) mode = "move";
+    dragRef.current = {
+      mode,
+      originX: event.clientX,
+      originStart: selection.start,
+      originEnd: selection.end
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    if (mode === "create") {
+      commitSelection(t, t + Math.max(1, Math.min(30, safeDuration * 0.05)));
+      onSeek(t);
+    }
+  }
+
+  function onPointerMove(event: ReactPointerEvent<SVGSVGElement>) {
+    const drag = dragRef.current;
+    if (!drag || !onSelectionChange) return;
+    const t = timeFromClientX(event.clientX);
+    if (drag.mode === "start") {
+      commitSelection(t, drag.originEnd);
+      onSeek(t);
+      return;
+    }
+    if (drag.mode === "end") {
+      commitSelection(drag.originStart, t);
+      onSeek(t);
+      return;
+    }
+    if (drag.mode === "move") {
+      const rect = svgRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const delta = ((event.clientX - drag.originX) / rect.width) * safeDuration;
+      const span = drag.originEnd - drag.originStart;
+      let nextStart = drag.originStart + delta;
+      nextStart = Math.max(0, Math.min(safeDuration - span, nextStart));
+      commitSelection(nextStart, nextStart + span);
+      return;
+    }
+    commitSelection(drag.originStart, t);
+  }
+
+  function onPointerUp(event: ReactPointerEvent<SVGSVGElement>) {
+    if (dragRef.current) {
+      dragRef.current = null;
+      try {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  const selStartX = (selection.start / safeDuration) * width;
+  const selEndX = (selection.end / safeDuration) * width;
+  const selX = Math.min(selStartX, selEndX);
+  const selW = Math.max(2, Math.abs(selEndX - selStartX));
 
   return (
     <svg
+      ref={svgRef}
       className="timeline"
       viewBox={`0 0 ${width} ${height}`}
       role="img"
-      onClick={(event) => {
-        const rect = event.currentTarget.getBoundingClientRect();
-        onSeek(((event.clientX - rect.left) / rect.width) * safeDuration);
-      }}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerLeave={onPointerUp}
     >
       <rect className="timeline-bg" x="0" y="0" width={width} height={height} />
+      <rect className="timeline-selection" x={selX} y="0" width={selW} height={height} />
+      <rect className="timeline-handle" x={selX - 3} y="0" width={6} height={height} />
+      <rect className="timeline-handle" x={selX + selW - 3} y="0" width={6} height={height} />
       {candidates.map((candidate) => {
         const active = currentTime >= candidate.start && currentTime <= candidate.end;
         return (
@@ -4881,31 +5679,24 @@ function Timeline({
           >
             <title>{`${candidate.title} ${formatTime(candidate.start)} - ${formatTime(candidate.end)}`}</title>
             <rect
-              className={`candidate-span ${active ? "active" : ""}`}
+              className={active ? "candidate-range active" : "candidate-range"}
               x={(candidate.start / safeDuration) * width}
-              y="0"
+              y="18"
               width={Math.max(2, ((candidate.end - candidate.start) / safeDuration) * width)}
-              height={height}
+              height={height - 36}
             />
           </g>
         );
       })}
-      <rect
-        className="selection-span"
-        x={(selection.start / safeDuration) * width}
-        y="0"
-        width={Math.max(2, ((selection.end - selection.start) / safeDuration) * width)}
-        height={height}
-      />
       {bins.map((bin) => {
-        const x = (bin.start / safeDuration) * width;
         const barWidth = Math.max(1, ((bin.end - bin.start) / safeDuration) * width - 1);
+        const x = (bin.start / safeDuration) * width;
         const barHeight = Math.max(2, (bin.score / 100) * 82);
         return <rect key={bin.index} className="bar" x={x} y={height - barHeight - 20} width={barWidth} height={barHeight} />;
       })}
       <line className="playhead" x1={(currentTime / safeDuration) * width} x2={(currentTime / safeDuration) * width} y1="0" y2={height} />
       <text x="12" y="22">
-        {formatTime(currentTime)} / {formatTime(duration)}
+        {formatTime(currentTime)} / {formatTime(duration)} · 选区 {formatTime(selection.start)}-{formatTime(selection.end)}
       </text>
     </svg>
   );

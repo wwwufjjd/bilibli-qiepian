@@ -95,7 +95,7 @@ if ($WithBiliup) {
     }
   }
   & $venvPython -m pip install --upgrade pip
-  & $venvPython -m pip install biliup==1.1.29
+  & $venvPython -m pip install biliup==1.2.1
 }
 
 if ($WithQwen) {
